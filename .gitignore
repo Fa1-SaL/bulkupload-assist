@@ -1,0 +1,11 @@
+token.pickle
+oauth_credentials.json
+service_account.json
+*_cache.json
+*.tmp
+logs/
+.venv/
+__pycache__/
+processing_summary.csv
+.superpowers/
+.venv314/
