@@ -1,0 +1,9 @@
+PyMuPDF
+customtkinter
+pydantic
+openai
+google-api-python-client
+google-auth
+google-auth-oauthlib
+comtypes
+docx2txt
