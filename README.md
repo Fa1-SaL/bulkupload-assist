@@ -137,6 +137,8 @@ The two options can be combined. Files still contain at most 99 records. Existin
 
 **Settings** has four categories: **General**, **Connections**, **Processing**, and **Export**. Changes apply on **Save**; **Cancel**, Escape, or closing the window discards them. Text size is fixed at 100% and has no user-adjustable control.
 
+The app uses Calibri for controls, tables, tooltips and candidate details. Install Calibri on your computer to display that typeface; otherwise the operating system supplies a fallback font.
+
 General contains remembered window/table layout and reopening the last folder. Connections contains the AI API key, optional secure key storage, model selection, and the AI connection test. Processing includes default JD matching, optional subfolder discovery, and a separate clear-analysis action. Export includes a remembered output folder, repeat-generation warnings, both export modes, and a separate clear-history action.
 
 The table supports vertical wheel/trackpad scrolling and horizontal scrolling with **Shift + wheel**. Smooth scrolling and short opening fades are built in, without Settings switches. Horizontal table movement uses pixel-sized animation steps. Settings pages accept wheel input even when the window itself has focus. Scrollbars remain slim and hide their thumb when no overflow exists. Match filters are hidden when JD matching is unchecked. Existing keyboard shortcuts and table selection remain available.

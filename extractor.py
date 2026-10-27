@@ -26,7 +26,7 @@ try:
     from workflow_policy import exportable, csv_fields, csv_values, attention_reasons, merge_duplicates, ReviewStore, parsed as parsed_candidate, clean as clean_field
     from app_preferences import DEFAULT_PREFERENCES, PreferenceStore, SecureApiKeyStore, SettingsWindow
     from ui_interactions import (SmoothTreeScroll, Tooltip, animate_window_open, animate_window_close, fade_through,
-                                 animate_height, is_animating, MOTION_ENTER_MS, MOTION_EXIT_MS)
+                                 animate_height, is_animating, MOTION_ENTER_MS, MOTION_EXIT_MS, UI_FONT_FAMILY)
 except Exception as startup_err:
     tb = traceback.format_exc()
     try:
@@ -40,6 +40,7 @@ except Exception as startup_err:
 # Setup CustomTkinter styling
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
+ctk.ThemeManager.theme["CTkFont"]["family"] = UI_FONT_FAMILY
 
 class LogRedirector:
     def __init__(self, filepath):
@@ -1677,7 +1678,7 @@ class ExtractorApp(ctk.CTk):
 
         style = ttk.Style()
         style.theme_use("default")
-        table_font = "SF Pro Text" if sys.platform == "darwin" else "Segoe UI"
+        table_font = UI_FONT_FAMILY
         style.configure("Treeview", background=TABLE_BG, foreground=TEXT, rowheight=36,
             fieldbackground=TABLE_BG, borderwidth=0, font=(table_font, 12))
         style.map("Treeview", background=[("selected", SELECTED_ROW)])
@@ -2008,8 +2009,8 @@ class ExtractorApp(ctk.CTk):
         scale = 1.0
         ctk.set_widget_scaling(scale)
         if hasattr(self, 'tree'):
-            ttk.Style().configure('Treeview', rowheight=round(36*scale), font=('Helvetica',round(12*scale)))
-            ttk.Style().configure('Treeview.Heading', font=('Helvetica',round(12*scale),'bold'))
+            ttk.Style().configure('Treeview', rowheight=round(36*scale), font=(UI_FONT_FAMILY,round(12*scale)))
+            ttk.Style().configure('Treeview.Heading', font=(UI_FONT_FAMILY,round(12*scale),'bold'))
             # CTk's scaling callback replays its last geometry-manager call,
             # including widgets hidden by grid_remove. Restore intended visibility.
             self._sync_jd_section(animate=False)
@@ -3041,7 +3042,7 @@ class ExtractorApp(ctk.CTk):
             if not value or value == "N/A":
                 return
             heading(title)
-            font = ctk.CTkFont(family="Menlo" if sys.platform == "darwin" else "Consolas", size=11) if mono else None
+            font = ctk.CTkFont(family=UI_FONT_FAMILY, size=11) if mono else None
             ctk.CTkLabel(frame, text=value, wraplength=540, justify="left", anchor="w", font=font).pack(fill="x")
 
         # Gaps come before strengths: they decide whether a candidate goes forward.

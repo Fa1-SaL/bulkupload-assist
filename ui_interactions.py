@@ -10,6 +10,7 @@ import time
 import tkinter as tk
 
 
+UI_FONT_FAMILY = "Calibri"
 _TK_ERRORS = (tk.TclError, RuntimeError)
 
 
@@ -508,7 +509,7 @@ class Tooltip:
             tip.wm_overrideredirect(True)
             tip.attributes('-topmost', True)
             tk.Label(tip, text=text, justify='left', wraplength=320, bg='#11141A', fg='#E6EAF0',
-                     padx=10, pady=6, font=('Helvetica', 12)).pack()
+                     padx=10, pady=6, font=(UI_FONT_FAMILY, 12)).pack()
             x = self.widget.winfo_rootx()
             y = self.widget.winfo_rooty() + self.widget.winfo_height() + 6
             tip.update_idletasks()
