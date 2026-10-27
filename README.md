@@ -81,11 +81,11 @@ The model menu is defined by `OPENAI_MODELS` in `extractor.py`. Extraction and e
 2. Configure the OAuth consent screen. If the app is in testing, add the Google account you will use as a test user.
 3. Create an OAuth client with the **Desktop app** application type.
 4. Download its JSON credentials and save them beside `drive_uploader.py` as `oauth_credentials.json`.
-5. Set `DRIVE_FOLDER_ID` in `drive_uploader.py` to your destination folder's ID. Replace the project-specific default when using your own Drive.
+5. Configure the destination using `DRIVE_FOLDER_ID` in `drive_uploader.py`. Drive uploads and sign-in continue to work normally; Google Drive controls are not exposed in Settings. Existing saved destination configuration is preserved.
 
 On the first upload, the app opens a browser for Google sign-in and saves the authorization locally as `token.pickle`. It requests the `drive.file` scope. The app uses OAuth desktop credentials; a service-account file is not required.
 
-If the configured folder rejects an upload because of permissions, the uploader can fall back to the root of My Drive.
+Uploads stay in the configured folder. A permission failure is shown as a failure with a retry action; uploads never silently move to My Drive root.
 
 ## Run the app
 
@@ -98,14 +98,16 @@ python extractor.py
 3. Enable **Match against a job description** if you want matching, then paste the description or choose a JD file. Leave it unchecked to parse and upload without matching.
 4. Click **Process resumes**. Results appear as files are processed.
 5. Search or sort results, switch to **All columns**, or open **View details** for a selected row. Details also open with Enter or a double-click.
-6. Monitor processing and upload progress. Use **View activity**, **Retry uploads**, or **Cancel uploads** as needed. Cancelling uploads does not stop resume processing.
-7. Click **Export CSV**, enter the required Job ID and any optional export fields, and choose a destination.
+6. Monitor the processing and upload stages. The primary button shows **Processing…**, **Uploading…**, **Retry processing / uploads**, or **Done ✓**. Use **Activity**, **Retry uploads**, or **Cancel uploads** as needed. Cancelling uploads does not stop resume processing.
+7. Review **Needs attention**, open the source file, edit candidate fields, or select **Evaluate anyway** for a resume whose JD similarity was too low to score. Edits are marked and saved by source content hash for future reruns. Duplicate email records are merged; details show their source filenames.
+8. Click **Export CSV**, choose all eligible or filtered records, enter the Job ID for a standard export, and choose a destination.
+9. After the batch settles, **Clear batch** resets the results and progress for the next batch. Source files, uploaded files, caches, saved corrections and CSV history remain.
 
-A new processing run is blocked while processing or uploads are still pending. **Complete with issues** means some files need attention; review the activity report and row statuses.
+A new processing run is blocked while processing, uploads, or a Drive connection operation are still pending. Closing during active processing asks for confirmation. **Complete with issues** means some files need attention; review the activity report and row statuses.
 
 ## CSV output
 
-Export includes eligible candidates whose uploads are complete. The export is deduplicated independently of the table's current search and minimum-match filters; it is not an export of only the visible rows.
+By default, export includes complete candidates with uploaded resumes. The export dialog explicitly offers **All eligible** and **Filtered** scopes with counts. Records are deduplicated by email. Previously generated candidates for the same Job ID trigger a warning; recent Job IDs require an explicit selection. Job-specific rate, availability, notes and full-time fields start fresh in each dialog. Generating a CSV does not submit candidates to an ATS.
 
 Files are written to the selected directory as:
 
@@ -122,6 +124,25 @@ name,email,phone,country,job_id,expected_rate,availability_weeks,
 resume_link,years_of_experience,linkedin_url,notes,is_fulltime,match_percentage
 ```
 
+### Export options
+
+Both optional modes are **off by default** in **Settings → Export**:
+
+- **Export Missing too** includes settled, parsed candidates with incomplete data. Missing fields, failed/missing resume links and unavailable scores are blank. Unreadable files, extraction failures, parsing placeholders and uploads still in progress are excluded.
+- **Regular export** writes only `name,email,phone,country,resume_link,years_of_experience,linkedin_url`. It adds `match_percentage` only when JD matching was enabled for the processed batch. Changing the live JD checkbox afterwards does not change that batch's export columns. Job ID is optional and the added job/rate/availability/notes/full-time columns are omitted.
+
+The two options can be combined. Files still contain at most 99 records. Existing output names require confirmation before replacement.
+
+## Settings and interaction
+
+**Settings** has four categories: **General**, **Connections**, **Processing**, and **Export**. Changes apply on **Save**; **Cancel**, Escape, or closing the window discards them. Text size is fixed at 100% and has no user-adjustable control.
+
+General contains remembered window/table layout and reopening the last folder. Connections contains the AI API key, optional secure key storage, model selection, and the AI connection test. Processing includes default JD matching, optional subfolder discovery, and a separate clear-analysis action. Export includes a remembered output folder, repeat-generation warnings, both export modes, and a separate clear-history action.
+
+The table supports vertical wheel/trackpad scrolling and horizontal scrolling with **Shift + wheel**. Smooth scrolling and short opening fades are built in, without Settings switches. Horizontal table movement uses pixel-sized animation steps. Settings pages accept wheel input even when the window itself has focus. Scrollbars remain slim and hide their thumb when no overflow exists. Match filters are hidden when JD matching is unchecked. Existing keyboard shortcuts and table selection remain available.
+
+API key persistence is opt-in and off by default. When enabled, `keyring` must provide a native secure OS credential store (macOS Keychain, Windows Credential Manager, or supported Linux desktop credential storage). There is no plaintext fallback. Without it, the key can still be used for the current session. JSON preferences never contain the API key.
+
 ## Local data and privacy
 
 Resume text is sent to the OpenAI API for extraction and, when enabled, job matching. Eligible resume files are uploaded to Google Drive. Use data you are authorized to process and review extracted information and match assessments before relying on them.
@@ -135,10 +156,12 @@ The app stores runtime data locally:
 | `resume_cache.json` | Cached extraction and matching data |
 | `jd_cache.json` | Cached job-description data |
 | `drive_cache.json` | Cached upload links and file hashes |
+| `preferences.json` | Non-secret workspace and export preferences |
+| `review_state.json` | Hash-scoped manual corrections and per-job CSV history |
 | `logs/` | Application logs |
 | `processing_summary.csv` | Per-file processing report in the selected resume folder |
 
-Credentials, tokens, caches, logs, virtual environments, and processing summaries are excluded by `.gitignore`. Keep resume folders and exported CSV files outside the source checkout; they can contain personal information.
+Credentials, tokens, preferences, review state, caches, logs, virtual environments, and processing summaries are excluded by `.gitignore`. Keep resume folders and exported CSV files outside the source checkout; they can contain personal information.
 
 ## Tests
 
@@ -161,3 +184,5 @@ test_loading_flow.py Folder-discovery and loading-flow tests
 test_ui_flow.py      Desktop workflow and UI regression tests
 docs/superpowers/    Design and implementation notes
 ```
+
+The regression suite mocks AI and Drive requests and isolates local state. It includes live Tk widget checks for settings transactions and reopening, window-focused Settings/table scrolling, pixel-sized horizontal animation, batch states, Clear, motion cancellation, and export modes. These checks do not replace a VoiceOver/NVDA accessibility audit or validation against your live service accounts.

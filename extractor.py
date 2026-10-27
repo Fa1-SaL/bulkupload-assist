@@ -23,6 +23,10 @@ try:
     from typing import Optional, List, Callable, Tuple
     from openai import OpenAI, AsyncOpenAI
     from drive_uploader import upload_all_resumes, get_file_hash, atomic_write_json
+    from workflow_policy import exportable, csv_fields, csv_values, attention_reasons, merge_duplicates, ReviewStore, parsed as parsed_candidate, clean as clean_field
+    from app_preferences import DEFAULT_PREFERENCES, PreferenceStore, SecureApiKeyStore, SettingsWindow
+    from ui_interactions import (SmoothTreeScroll, Tooltip, animate_window_open, animate_window_close, fade_through,
+                                 animate_height, is_animating, MOTION_ENTER_MS, MOTION_EXIT_MS)
 except Exception as startup_err:
     tb = traceback.format_exc()
     try:
@@ -407,7 +411,7 @@ def normalize_and_validate_candidate(candidate_data: dict, raw_resume_text: str,
     
     # 4. Validate Candidate
     def is_invalid_value(val):
-        return not val or str(val).strip() in ("", "Not Found", "API Error", "Read Error", "Filtered", "None")
+        return val is None or str(val).strip() in ("", "Not Found", "API Error", "Read Error", "Filtered", "None")
         
     if is_invalid_value(cand.get("Name")):
         return cand, "Missing Name"
@@ -431,7 +435,7 @@ def is_valid_candidate(row: dict, allow_pending: bool = False) -> bool:
         return False
     
     def is_invalid_value(val):
-        return not val or str(val).strip() in ("", "Not Found", "API Error", "Read Error", "Filtered", "None")
+        return val is None or str(val).strip() in ("", "Not Found", "API Error", "Read Error", "Filtered", "None")
         
     if is_invalid_value(row.get("Name")):
         return False
@@ -467,22 +471,7 @@ def safe_match_percentage(cand: dict) -> float:
         return 0.0
 
 def get_deduplicated_candidates(candidates: list) -> list:
-    email_groups = {}
-    for cand in candidates:
-        email = str(cand.get("Email", "")).lower().strip()
-        if email not in email_groups:
-            email_groups[email] = []
-        email_groups[email].append(cand)
-        
-    deduped = []
-    for email, group in email_groups.items():
-        if not email or email in ("not found", "api error", "read error", "filtered", "none"):
-            deduped.extend(group)
-        else:
-            # Prefer a valid candidate over an incomplete parse of the same person
-            best_cand = max(group, key=lambda c: (is_valid_candidate(c, allow_pending=True), safe_match_percentage(c)))
-            deduped.append(best_cand)
-    return deduped
+    return merge_duplicates(candidates)
 
 
 BATCH_THRESHOLD = 15
@@ -1070,7 +1059,7 @@ Now execute the 4-step methodology above. Be strict, evidence-based, and compute
     except Exception as e:
         print(f"Match Evaluation Error: {e}")
         return {
-            "MatchPercentage": 0, "TechnicalMatch": 0, "ExperienceMatch": 0, "DomainMatch": 0,
+            "MatchPercentage": "Not evaluated", "TechnicalMatch": None, "ExperienceMatch": None, "DomainMatch": None,
             "Strengths": [], "Weaknesses": [], "MissingRequirements": [],
             "Summary": f"Evaluation Failed: {e}", "SkillEvidence": []
         }
@@ -1107,6 +1096,9 @@ def extract_data_with_ai(text, filename, client, model=LUNA_MODEL):
         print(f"API Error for {filename}: {e}")
         return {"Name": "API Error", "Email": "API Error", "Phone": "API Error", "Country": "API Error", "YearsOfExperience": "API Error", "SourceFilename": filename}
 
+
+PREFERENCES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "preferences.json")
+REVIEW_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "review_state.json")
 
 RESUME_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "resume_cache.json")
 JD_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jd_cache.json")
@@ -1372,19 +1364,25 @@ Execute the 4-step scoring methodology and return JSON."""
     except Exception as e:
         print(f"Match Evaluation Error: {e}")
         return {
-            "MatchPercentage": 0, "TechnicalMatch": 0, "ExperienceMatch": 0, "DomainMatch": 0,
+            "MatchPercentage": "Not evaluated", "TechnicalMatch": None, "ExperienceMatch": None, "DomainMatch": None,
             "Strengths": [], "Weaknesses": [], "MissingRequirements": [],
             "Summary": f"Evaluation Failed: {e}", "SkillEvidence": []
         }
 
 
-def discover_resume_files(folder):
+def discover_resume_files(folder, recursive=False):
     """Read-only folder discovery shared by preview and explicit processing."""
     supported, skipped = [], []
-    for filename in sorted(os.listdir(folder)):
+    if recursive:
+        filenames = [os.path.relpath(os.path.join(root, name), folder)
+                     for root, dirs, names in os.walk(folder, followlinks=False)
+                     for name in names]
+    else:
+        filenames = os.listdir(folder)
+    for filename in sorted(filenames):
         if not os.path.isfile(os.path.join(folder, filename)):
             continue
-        if filename.startswith('~$') or filename == 'processing_summary.csv':
+        if os.path.basename(filename).startswith('~$') or os.path.basename(filename) == 'processing_summary.csv':
             continue
         if os.path.splitext(filename)[1].lower() in ('.pdf', '.docx', '.doc', '.txt'):
             supported.append(filename)
@@ -1415,7 +1413,12 @@ SCROLL_THUMB_HOVER = "#657184"
 
 COMPACT_COLUMNS = ("Name", "MatchPct", "YearsExp", "Country", "ResumeLink")
 SCORE_FILTERS = {"All": "0", "50+": "50", "70+": "70", "85+": "85"}
-SHORTCUT_KEY = "⌘" if sys.platform == "darwin" else "Ctrl+"
+def shortcut_label(action, platform=None):
+    """Display text for a keyboard shortcut in the platform's own notation."""
+    mac = (platform or sys.platform) == "darwin"
+    labels = {"open": ("⌘O", "Ctrl+O"), "process": ("⌘↩", "Ctrl+Enter"), "export": ("⌘E", "Ctrl+E"),
+              "search": ("⌘F", "Ctrl+F"), "settings": ("⌘,", "Ctrl+,"), "fullscreen": ("⌃⌘F", "F11")}
+    return labels[action][0 if mac else 1]
 REVEAL_LABEL = "Show in Finder" if sys.platform == "darwin" else "Open folder"
 
 
@@ -1423,6 +1426,15 @@ def secondary_button(parent, **kwargs):
     """Neutral button used for every non-primary action."""
     kwargs.setdefault("height", 36)
     return ctk.CTkButton(parent, fg_color=SECONDARY, hover_color=SECONDARY_HOVER, **kwargs)
+
+
+def link_button(parent, **kwargs):
+    """Text-weight action that sits inside a line of text or a header."""
+    kwargs.setdefault("height", 28)
+    kwargs.setdefault("width", 0)
+    kwargs.setdefault("text_color", LINK_TEXT)
+    return ctk.CTkButton(parent, fg_color="transparent", hover_color=SECONDARY,
+                         text_color_disabled=HINT_TEXT, **kwargs)
 
 
 def upload_status_display(status):
@@ -1451,6 +1463,36 @@ def as_percent(value):
         return None
 
 
+MATCH_TIERS = ((75, "Strong", "#2E7D4F"), (50, "Partial", "#8A6A1F"), (0, "Weak", "#8B3A3A"))
+
+
+def match_tier(score):
+    """(word, badge colour) for a 0-100 score; white text meets 4.5:1 on each colour."""
+    for floor, word, colour in MATCH_TIERS:
+        if score >= floor:
+            return word, colour
+    return MATCH_TIERS[-1][1:]
+
+
+def format_phone_display(phone):
+    """Group a stored digits-only phone for reading; anything else is shown as stored."""
+    digits = str(phone or "")
+    if not digits.isdigit():
+        return digits
+    if len(digits) == 10:
+        return f"{digits[:3]} {digits[3:6]} {digits[6:]}"
+    if len(digits) == 11 and digits[0] == "1":
+        return f"+1 {digits[1:4]} {digits[4:7]} {digits[7:]}"
+    return digits
+
+
+def match_display(value):
+    """Table text for a match score: "86%", or an em dash when there is no score.
+    Why a score is missing is listed under Needs attention and in the details."""
+    score = as_percent(value)
+    return "—" if score is None else f"{score:.0f}%"
+
+
 def run_progress(match_progress, finished_uploads, total_uploads, pipeline_running, run_started):
     """Overall run progress for the single bar: half processing, half uploads."""
     if not run_started:
@@ -1474,25 +1516,36 @@ def reveal_in_file_manager(path):
 
 class ExtractorApp(ctk.CTk):
     def __init__(self):
+        self._preference_store = PreferenceStore(PREFERENCES_FILE)
+        self.preferences = self._preference_store.load()
+        self._review_store = ReviewStore(REVIEW_FILE)
+        self._secret_store = SecureApiKeyStore()
+        ctk.set_widget_scaling(self.preferences['text_scale'])
         super().__init__()
         self.title("Bulk Upload Assistant")
         self.center_window(1440, 900)
         self.minsize(1200, 700)
+        if self.preferences['remember_workspace'] and self.preferences['window_geometry']:
+            try: self.geometry(self.preferences['window_geometry'])
+            except tk.TclError: pass
 
-        # Application icon support
-        icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app_icon.ico")
-        if os.path.exists(icon_path):
+        # A PNG works for the window and Dock on every platform; an .ico, if present, suits Windows.
+        here = os.path.dirname(os.path.abspath(__file__))
+        try:
+            self._icon = tk.PhotoImage(file=os.path.join(here, "app_icon.png"))
+            self.iconphoto(True, self._icon)
+        except (tk.TclError, OSError):
+            pass
+        if sys.platform.startswith("win") and os.path.exists(os.path.join(here, "app_icon.ico")):
             try:
-                self.wm_iconbitmap(icon_path)
-            except Exception:
-                try:
-                    self.iconphoto(False, tk.PhotoImage(file=icon_path))
-                except Exception:
-                    pass
+                self.wm_iconbitmap(os.path.join(here, "app_icon.ico"))
+            except tk.TclError:
+                pass
 
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(3, weight=1)
         self._details_window = None
+        self._batch_windows = []
         self._settings_open = False
         self._jd_open = True
         self._activity_open = False
@@ -1503,12 +1556,12 @@ class ExtractorApp(ctk.CTk):
         self.lbl_title = ctk.CTkLabel(self.frame_header, text="Bulk Upload Assistant",
                                     font=ctk.CTkFont(size=18, weight="bold"))
         self.lbl_title.pack(side="left")
-        self.btn_settings = secondary_button(self.frame_header, text="Settings", width=90,
+        self.btn_settings = secondary_button(self.frame_header, text="Settings", width=120,
                                              command=self.toggle_settings)
         self.btn_settings.pack(side="right")
         # Shown only while the key is missing; Settings keeps its place either way.
-        self.btn_key_chip = ctk.CTkButton(self.frame_header, text="API key needed", width=120, height=28,
-            corner_radius=14, fg_color="transparent", border_width=1, border_color=WARNING_TEXT,
+        self.btn_key_chip = ctk.CTkButton(self.frame_header, text="API key needed", width=120, height=36,
+            corner_radius=6, fg_color="transparent", border_width=1, border_color=WARNING_TEXT,
             text_color=WARNING_TEXT, hover_color=SECONDARY, command=self.toggle_settings)
         self.btn_key_chip.pack(side="right", padx=12)
 
@@ -1524,33 +1577,16 @@ class ExtractorApp(ctk.CTk):
                                            command=self.browse_dir)
         self.btn_browse.grid(row=0, column=2, padx=(0, 16), pady=12)
 
-        # Settings live in their own small window so opening them never reflows the main one.
-        self._settings_window = ctk.CTkToplevel(self)
-        self._settings_window.title("Settings")
-        self._settings_window.resizable(False, False)
-        self._settings_window.transient(self)
-        self._settings_window.withdraw()
-        self._settings_window.protocol("WM_DELETE_WINDOW", self.toggle_settings)
-        self._settings_window.bind("<Escape>", lambda event: self.toggle_settings())
-        self.frame_settings = ctk.CTkFrame(self._settings_window, fg_color="transparent")
-        self.frame_settings.pack(fill="both", expand=True, padx=24, pady=20)
-        self.frame_settings.grid_columnconfigure(0, weight=1)
-        self.lbl_api = ctk.CTkLabel(self.frame_settings, text="OpenAI API key", anchor="w")
-        self.lbl_api.grid(row=0, column=0, sticky="w")
         self.sv_api_key = tk.StringVar()
-        self.entry_api = ctk.CTkEntry(self.frame_settings, textvariable=self.sv_api_key, show="*",
-                                      width=380, height=36)
-        self.entry_api.grid(row=1, column=0, sticky="ew", pady=(4, 14))
-        self.entry_api.bind("<Return>", lambda event: self.toggle_settings())
-        self.lbl_model = ctk.CTkLabel(self.frame_settings, text="Model", anchor="w")
-        self.lbl_model.grid(row=2, column=0, sticky="w")
-        self.sv_model = tk.StringVar(value=OPENAI_MODELS[0])
-        self.combo_model = ctk.CTkOptionMenu(self.frame_settings, variable=self.sv_model,
-                                           values=OPENAI_MODELS, width=200, height=36)
-        self.combo_model.grid(row=3, column=0, sticky="w", pady=(4, 20))
-        self.btn_settings_done = ctk.CTkButton(self.frame_settings, text="Done", width=90, height=36,
-                                               command=self.toggle_settings)
-        self.btn_settings_done.grid(row=4, column=0, sticky="e")
+        self.sv_model = tk.StringVar(value=self.preferences['model'])
+        if self.preferences['remember_api_key']:
+            try: self.sv_api_key.set(self._secret_store.get() or '')
+            except Exception: pass  # The key can still be entered for this session.
+        self._settings_window = self._make_settings_window()
+        self.entry_api = self._settings_window.api_entry
+        self.combo_model = self._settings_window.model_menu
+        if self.preferences['reopen_last_folder'] and self.preferences['last_folder']:
+            self.sv_dir.set(self.preferences['last_folder'])
 
         # Job setup collapses to a one-line summary without changing the results area's width.
         self.frame_jd = ctk.CTkFrame(self)
@@ -1559,24 +1595,46 @@ class ExtractorApp(ctk.CTk):
         self.frame_jd_header = ctk.CTkFrame(self.frame_jd, fg_color="transparent")
         self.frame_jd_header.grid(row=0, column=0, padx=16, pady=8, sticky="ew")
         self.frame_jd_header.grid_columnconfigure(1, weight=1)
-        self.bv_jd_matching = tk.BooleanVar(value=True)
+        self.bv_jd_matching = tk.BooleanVar(value=self.preferences['jd_matching_default'])
         self.chk_jd_matching = ctk.CTkCheckBox(self.frame_jd_header,
             text="Match against a job description", variable=self.bv_jd_matching,
             command=self.on_jd_matching_toggled)
         self.chk_jd_matching.grid(row=0, column=0, sticky="w")
-        self.lbl_jd_summary = ctk.CTkLabel(self.frame_jd_header, text="", text_color=MUTED_TEXT, anchor="e")
+        # While processing, the box folds to this summary; clicking it opens the box again.
+        self.lbl_jd_summary = ctk.CTkLabel(self.frame_jd_header, text="", text_color=MUTED_TEXT, anchor="w")
         self.lbl_jd_summary.grid(row=0, column=1, sticky="ew", padx=12)
-        self.btn_jd_toggle = secondary_button(self.frame_jd_header, text="Hide", width=80, height=32,
-                                              command=self.toggle_jd)
-        self.btn_jd_toggle.grid(row=0, column=2, sticky="e")
-        self.frame_jd_body = ctk.CTkFrame(self.frame_jd, fg_color="transparent")
-        self.frame_jd_body.grid(row=1, column=0, padx=16, pady=(0, 12), sticky="ew")
+        self.lbl_jd_summary.bind("<Button-1>", lambda event: self._open_jd())
+        self.btn_upload_jd = link_button(self.frame_jd_header, text="Choose JD file…", command=self.upload_jd)
+        self.btn_upload_jd.grid(row=0, column=2, sticky="e")
+        # The box opens and closes by animating a clipping frame's height; the body
+        # keeps its natural size inside it, so nothing reflows mid-animation.
+        jd_background = self.frame_jd._apply_appearance_mode(self.frame_jd.cget("fg_color"))
+        self.frame_jd_clip = tk.Frame(self.frame_jd, height=0, bd=0, highlightthickness=0, bg=jd_background)
+        self.frame_jd_clip.grid(row=1, column=0, sticky="ew")
+        self.frame_jd_clip.grid_propagate(False)
+        self.frame_jd_body = ctk.CTkFrame(self.frame_jd_clip, fg_color="transparent")
         self.frame_jd_body.grid_columnconfigure(0, weight=1)
+        self.frame_jd_body.bind("<Configure>", lambda event: self._fit_jd_clip(), add="+")
         self.txt_jd = ctk.CTkTextbox(self.frame_jd_body, wrap="word", height=88, font=ctk.CTkFont(size=14))
-        self.txt_jd.grid(row=0, column=0, sticky="ew", padx=(0, 12))
-        self.btn_upload_jd = secondary_button(self.frame_jd_body, text="Choose JD file", width=120,
-                                              command=self.upload_jd)
-        self.btn_upload_jd.grid(row=0, column=1, sticky="n")
+        self.txt_jd.grid(row=0, column=0, sticky="ew", padx=16)
+        # CTkTextbox has no placeholder; an overlaid hint disappears on focus or text.
+        self.lbl_jd_hint = ctk.CTkLabel(self.txt_jd, text="Paste the job description here, or choose a file.",
+            font=ctk.CTkFont(size=14, slant="italic"), text_color=HINT_TEXT,
+            fg_color=self.txt_jd.cget("fg_color"), height=20, anchor="w")
+        self.lbl_jd_hint.place(x=10, y=8)
+        self.lbl_jd_hint.bind("<Button-1>", lambda event: self.txt_jd.focus_set())
+        self.txt_jd.bind("<FocusIn>", lambda event: self._update_jd_hint(), add="+")
+        self.txt_jd.bind("<FocusOut>", lambda event: self._update_jd_hint(), add="+")
+        self.txt_jd.bind("<KeyRelease>", lambda event: self._on_jd_edited(), add="+")
+        self.txt_jd.bind("<<Paste>>", lambda event: self.after_idle(self._on_jd_edited), add="+")
+        # Text inserted by code (a JD file, a cleared batch) must hide the hint too.
+        def on_modified(event):
+            self.txt_jd._textbox.edit_modified(False)
+            self._update_jd_hint()
+        self.txt_jd._textbox.bind("<<Modified>>", on_modified, add="+")
+        self.lbl_jd_error = ctk.CTkLabel(self.frame_jd_body, text="Add a job description, or untick matching "
+            "to process resumes without scores.", text_color=WARNING_TEXT, anchor="w", height=20)
+        self._jd_error_shown = False
 
         self.frame_table_container = ctk.CTkFrame(self)
         self.frame_table_container.grid(row=3, column=0, padx=20, pady=(0, 8), sticky="nsew")
@@ -1606,7 +1664,7 @@ class ExtractorApp(ctk.CTk):
         self.sv_min_score = tk.StringVar(value="0")
         self.sv_min_score.trace_add("write", lambda *args: self.filter_table())
         self.seg_min_score = ctk.CTkSegmentedButton(self.frame_min_score, values=list(SCORE_FILTERS),
-                                                    height=32, command=self._on_score_filter)
+                                                    height=36, command=self._on_score_filter)
         self.seg_min_score.set("All")
         self.seg_min_score.pack(side="left")
         self.btn_details = secondary_button(self.frame_filters, text="View details", width=110,
@@ -1635,12 +1693,13 @@ class ExtractorApp(ctk.CTk):
         widths = {"Name": 260, "Status": 200, "Email": 240, "Phone": 150, "Country": 180,
                   "YearsExp": 110, "MatchPct": 100, "MissingSkills": 260, "ResumeLink": 180}
         for col in columns:
-            self.tree.heading(col, text=self._headings[col],
+            # Headings align with their values: text left, numbers right.
+            anchor = {"MatchPct": "e", "YearsExp": "center"}.get(col, "w")
+            self.tree.heading(col, text=self._headings[col], anchor=anchor,
                               command=lambda c=col: self.sort_table(c, c in ("YearsExp", "MatchPct")))
-            self.tree.column(col, width=widths[col], minwidth=90,
-                             anchor="center" if col in ("YearsExp", "MatchPct") else "w")
-        # ttk cannot colour one cell, so only rows that need attention are tinted.
-        self.tree.tag_configure("problem", foreground=DANGER_TEXT)
+            self.tree.column(col, width=widths[col], minwidth=90, anchor=anchor)
+        # ttk cannot colour one cell, and a red row reads as a rejected candidate.
+        # Problem rows keep normal text; the status glyph and Needs attention carry it.
         self.tree.tag_configure("muted", foreground=HINT_TEXT)
         # Scrollbars keep their space and only show a thumb on overflow, so the table never resizes.
         self.scrollbar_y = ctk.CTkScrollbar(self.frame_table_container, orientation="vertical", width=8,
@@ -1656,10 +1715,41 @@ class ExtractorApp(ctk.CTk):
         self.lbl_empty = ctk.CTkLabel(self.frame_table_container, text=self._idle_empty_text(),
                                       text_color=MUTED_TEXT, fg_color=TABLE_BG)
         self.lbl_empty.place(relx=0.5, rely=0.56, anchor="center")
+        # First run: a short checklist that ticks itself off, instead of only shortcuts.
+        self.frame_empty = ctk.CTkFrame(self.frame_table_container, fg_color=TABLE_BG)
+        ctk.CTkLabel(self.frame_empty, text="Get started", font=ctk.CTkFont(size=16, weight="bold"),
+                     anchor="w").pack(fill="x", pady=(0, 6))
+        self._setup_steps = {}
+        for key, command in (("key", self._open_api_key_settings), ("folder", self.browse_dir),
+                             ("jd", self._focus_jd)):
+            step = link_button(self.frame_empty, text="", height=30, anchor="w",
+                               font=ctk.CTkFont(size=14), command=command)
+            step.pack(fill="x")
+            self._setup_steps[key] = step
+        ctk.CTkLabel(self.frame_empty, text=self._idle_empty_text().split("\n", 1)[1],
+                     text_color=HINT_TEXT, anchor="w").pack(fill="x", pady=(8, 0))
         self.tree.bind("<Double-1>", self.on_row_double_click)
         self.tree.bind("<Return>", self.on_row_double_click)
         self.tree.bind("<space>", self.on_row_double_click)
         self.tree.bind("<<TreeviewSelect>>", self.on_candidate_selected)
+        self._smooth_scroll = SmoothTreeScroll(self.tree,
+            enabled=lambda: self.preferences['smooth_scrolling'],
+            reduced_motion=lambda: self.preferences['reduce_motion'])
+        for sequence in ('<MouseWheel>', '<Shift-MouseWheel>', '<Button-4>', '<Button-5>'):
+            self.bind(sequence, self._route_table_wheel, add='+')
+        self.bind('<TouchpadScroll>', lambda event: self._route_table_wheel(event, touchpad=True), add='+')
+        # Bypass CTkScrollbar's coarse wheel callback; keep its click/drag bindings.
+        for bar, axis in ((self.scrollbar_x,'x'), (self.scrollbar_y,'y')):
+            for sequence in ('<MouseWheel>', '<Shift-MouseWheel>', '<Button-4>', '<Button-5>'):
+                bar._canvas.bind(sequence, lambda event, a=axis:
+                    self._smooth_scroll.handle_wheel(event, axis='x' if event.state & 1 else a))
+            bar._canvas.bind('<TouchpadScroll>', self._smooth_scroll.handle_touchpad)
+        self.bv_attention = tk.BooleanVar(value=False)
+        self.chk_attention = ctk.CTkCheckBox(self.frame_filters, text='Needs attention (0)',
+            variable=self.bv_attention, command=self.filter_table)
+        self.chk_attention.pack(side='left', padx=8)
+        self.lbl_result_count = ctk.CTkLabel(self.frame_header, text='', text_color=MUTED_TEXT)
+        self.lbl_result_count.pack(side='left', padx=20)
 
         # A reusable activity window keeps the table and actions fixed in place.
         self._activity_window = ctk.CTkToplevel(self)
@@ -1679,16 +1769,25 @@ class ExtractorApp(ctk.CTk):
         self.frame_upload_stats.grid(row=0, column=0, sticky="ew", padx=16)
         for attr, label in (("lbl_uploaded_cnt", "Uploaded"), ("lbl_uploading_cnt", "Uploading"),
                             ("lbl_failed_cnt", "Failed"), ("lbl_cancelled_cnt", "Cancelled"), ("lbl_total_cnt", "Total")):
-            widget = ctk.CTkLabel(self.frame_upload_stats, text=f"{label}: 0", text_color=MUTED_TEXT)
+            if attr == "lbl_failed_cnt":
+                # Failures are the one count worth acting on: it filters the table to them.
+                widget = link_button(self.frame_upload_stats, text=f"{label}: 0", height=22,
+                                     command=self._show_attention_rows)
+            else:
+                widget = ctk.CTkLabel(self.frame_upload_stats, text=f"{label}: 0", text_color=MUTED_TEXT)
             widget.pack(side="left", padx=(0, 20))
             setattr(self, attr, widget)
+        self.btn_copy_log = link_button(self.frame_upload_stats, text="Copy log", height=22,
+            command=lambda: self._copy_to_clipboard(self.btn_copy_log, self._activity_text(), "Copy log"))
+        self.btn_copy_log.pack(side="right")
         self.lbl_curr_upload = ctk.CTkLabel(self.frame_activity, text="No uploads in progress", anchor="w", text_color=MUTED_TEXT)
         self.lbl_curr_upload.grid(row=1, column=0, sticky="ew", padx=16)
         self.txt_activity = ctk.CTkTextbox(self.frame_activity, height=130, wrap="word")
         self.txt_activity.grid(row=2, column=0, sticky="nsew", padx=16, pady=(4, 12))
         self.txt_activity.configure(state="disabled")
 
-        # One action bar: a single status line and progress bar, then actions in fixed slots.
+        # One action bar: run status, progress and its inline actions on the left;
+        # at most three buttons on the right, with Process fixed in the rightmost slot.
         self.frame_bottom = ctk.CTkFrame(self)
         self.frame_bottom.grid(row=4, column=0, padx=20, pady=(0, 16), sticky="ew")
         self.frame_bottom.grid_columnconfigure(0, weight=1)
@@ -1697,43 +1796,73 @@ class ExtractorApp(ctk.CTk):
         self.frame_status.grid_columnconfigure(0, weight=1)
         self.lbl_status = ctk.CTkLabel(self.frame_status, text="Ready to process resumes", anchor="w", height=22)
         self.lbl_status.grid(row=0, column=0, sticky="ew")
-        self.btn_reveal = ctk.CTkButton(self.frame_status, text=REVEAL_LABEL, width=110, height=22,
-            fg_color="transparent", hover_color=SECONDARY, text_color=LINK_TEXT, command=self._reveal_export)
-        self.btn_reveal.grid(row=0, column=1, padx=(8, 0))
+        self.btn_skipped = link_button(self.frame_status, text="", height=22, command=self.show_skipped_files)
+        self.btn_skipped.grid(row=0, column=1, padx=(8, 0))
+        self.btn_skipped.grid_remove()
+        self.btn_reveal = link_button(self.frame_status, text=REVEAL_LABEL, height=22, command=self._reveal_export)
+        self.btn_reveal.grid(row=0, column=2, padx=(8, 0))
         self.btn_reveal.grid_remove()
         self.lbl_upload_pct = ctk.CTkLabel(self.frame_status, text="", anchor="e", text_color=MUTED_TEXT, height=22)
-        self.lbl_upload_pct.grid(row=0, column=2, sticky="e", padx=(12, 0))
-        self.progress_bar = ctk.CTkProgressBar(self.frame_status, height=4)
-        self.progress_bar.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(8, 0))
-        self.progress_bar.set(0)
-        self.btn_activity = ctk.CTkButton(self.frame_bottom, text="Activity", width=80, height=36,
-            fg_color="transparent", hover_color=SECONDARY, text_color=MUTED_TEXT, command=self.toggle_activity)
-        self.btn_activity.grid(row=0, column=1, padx=(0, 8))
-        self.btn_retry = secondary_button(self.frame_bottom, text="Retry uploads", width=130,
+        self.lbl_upload_pct.grid(row=0, column=3, sticky="e", padx=(12, 0))
+        self.btn_retry = link_button(self.frame_status, text="Retry uploads", height=22,
             state="disabled", command=self.retry_failed_uploads)
-        self.btn_retry.grid(row=0, column=2, padx=(0, 8))
-        self.btn_cancel_uploads = secondary_button(self.frame_bottom, text="Cancel uploads", width=130,
+        self.btn_retry.grid(row=0, column=4, padx=(8, 0))
+        self.btn_cancel_uploads = link_button(self.frame_status, text="Cancel uploads", height=22,
             state="disabled", command=self.cancel_uploads)
-        self.btn_cancel_uploads.grid(row=0, column=3, padx=(0, 8))
+        self.btn_cancel_uploads.grid(row=0, column=5, padx=(8, 0))
+        self.btn_activity = link_button(self.frame_status, text="Activity log", height=22,
+            text_color=MUTED_TEXT, command=self.toggle_activity)
+        self.btn_activity.grid(row=0, column=6, padx=(12, 0))
+        self.progress_bar = ctk.CTkProgressBar(self.frame_status, height=4)
+        self.progress_bar.grid(row=1, column=0, columnspan=7, sticky="ew", pady=(8, 0))
+        self.progress_bar.set(0)
+        self._progress_colors = (self.progress_bar.cget("fg_color"), self.progress_bar.cget("progress_color"))
+        self._progress_shown = True
+        self.btn_clear = secondary_button(self.frame_bottom, text='Clear batch', width=130,
+            state='disabled', command=self.clear_batch)
+        self.btn_clear.grid(row=0, column=1, padx=(0, 8))
         self.btn_export = secondary_button(self.frame_bottom, text="Export CSV", width=150,
             state="disabled", command=self.show_export_menu)
-        self.btn_export.grid(row=0, column=4, padx=(0, 8))
-        self.btn_extract = ctk.CTkButton(self.frame_bottom, text="Process resumes", height=36, width=170,
+        self.btn_export.grid(row=0, column=2, padx=(0, 8))
+        self.btn_extract = ctk.CTkButton(self.frame_bottom, text="Process resumes", height=36, width=150,
             fg_color=ACCENT, hover_color=ACCENT_HOVER,
-            font=ctk.CTkFont(size=14, weight="bold"), command=self.start_extraction)
-        self.btn_extract.grid(row=0, column=5, padx=(0, 16))
-        # Slots keep their width when their button is hidden.
-        for col, width in ((2, 138), (3, 138), (4, 158)):
+            font=ctk.CTkFont(size=14), command=self.process_action)
+        self.btn_extract.grid(row=0, column=3, padx=(0, 16))
+        # Slots keep their width when their button is hidden, so Process never moves.
+        for col, width in ((1, 138), (2, 158)):
             self.frame_bottom.grid_columnconfigure(col, minsize=width)
         self._export_is_next = None
         self._sync_action_buttons()
 
         mod = "Command" if sys.platform == "darwin" else "Control"
         self.bind(f"<{mod}-o>", lambda event: self._shortcut(self.btn_browse, self.browse_dir))
-        self.bind(f"<{mod}-Return>", lambda event: self._shortcut(self.btn_extract, self.start_extraction))
+        self.bind(f"<{mod}-Return>", lambda event: self._shortcut(self.btn_extract, self.process_action))
         self.bind(f"<{mod}-e>", lambda event: self._shortcut(self.btn_export, self.show_export_menu))
         self.bind(f"<{mod}-f>", lambda event: self._shortcut(self.entry_search, self.entry_search.focus_set))
         self.bind(f"<{mod}-comma>", lambda event: self._shortcut(self.btn_settings, self.toggle_settings))
+        self.bind("<Button-1>", self._dismiss_settings_on_outside_click, add="+")
+        # macOS has a native animated fullscreen; elsewhere the change fades through.
+        self.bind("<Control-Command-f>" if sys.platform == "darwin" else "<F11>", lambda event: self.toggle_fullscreen())
+        self.bind("<Escape>", lambda event: self.toggle_fullscreen() if self.attributes("-fullscreen") else None, add="+")
+
+        # Disabled controls say why on hover; usable ones show their shortcut.
+        def when_disabled(widget, reason, shortcut=None):
+            return lambda: reason() if widget.cget("state") == "disabled" else shortcut
+        self._tooltips = [
+            Tooltip(self.btn_extract, when_disabled(self.btn_extract, self._process_disabled_reason,
+                    f"Process resumes ({shortcut_label('process')})")),
+            Tooltip(self.btn_settings, f"Settings ({shortcut_label('settings')})"),
+            Tooltip(self.btn_export, lambda: f"Export CSV ({shortcut_label('export')})"),
+            Tooltip(self.btn_details, when_disabled(self.btn_details, lambda: "Select a candidate in the table first.")),
+            Tooltip(self.btn_clear, when_disabled(self.btn_clear, lambda: "Available when the batch has finished.")),
+            Tooltip(self.chk_jd_matching, when_disabled(self.chk_jd_matching,
+                    lambda: "Matching can't change while a batch is running.")),
+            Tooltip(self.btn_browse, when_disabled(self.btn_browse,
+                    lambda: "The folder is locked while a batch is running.",
+                    f"Choose folder ({shortcut_label('open')})")),
+            Tooltip(self.btn_upload_jd, when_disabled(self.btn_upload_jd,
+                    lambda: "Tick “Match against a job description” to add one.")),
+        ]
 
         # Upload Tracking State
         self.total_uploads = 0
@@ -1742,6 +1871,7 @@ class ExtractorApp(ctk.CTk):
         self.cancelled_uploads = 0
         self.uploading_files = set()
         self._pipeline_running = False
+        self._connection_busy = False
         # Run generation of the run whose uploads were cancelled (None = not cancelled).
         # Written on the main thread, read by upload workers.
         self._uploads_cancelled_gen = None
@@ -1782,28 +1912,170 @@ class ExtractorApp(ctk.CTk):
         self._processed_count = 0
         self._processing_issue_count = 0
         self._processing_report = "No processing activity yet."
+        self._activity_log = []
+        self._preview_skipped = []
+        self._preview_found = None
         self._match_progress = 0.0
         self._shown_progress = 0.0
         self._progress_waiting = False
         self._last_export_dir = None
+        self._batch_folder = ''
+        self._batch_jd = ''
+        self._batch_model = self.sv_model.get()
+        self._batch_matching_enabled = False
+        self._batch_drive_folder = ''
+        self._evaluate_anyway = set()
+        self._visible_candidates = []
+        if self.preferences['remember_workspace']:
+            self._sort_state = tuple(self.preferences['sort_state']) if self.preferences['sort_state'] else None
+            for col, width in self.preferences['column_widths'].items():
+                if col in self.tree['columns']: self.tree.column(col, width=width)
+        self._apply_text_scale(self.preferences['text_scale'])
+        self._refresh_run_state()
+        self._update_matching_filters()
+        self._update_connection_status()
         self.sv_api_key.trace_add("write", self._update_connection_status)
         self.sv_dir.trace_add("write", self._schedule_folder_preview)
-        self._sync_jd_section()
+        self._sync_jd_section(animate=False)
         self._schedule_folder_preview()  # Show what the default folder holds right away.
 
+    def _make_settings_window(self):
+        return SettingsWindow(self, self.preferences, self.sv_api_key.get(), OPENAI_MODELS,
+            self._save_settings, on_test_ai=self._test_ai_connection,
+            on_clear_analysis=self._clear_analysis_cache, on_clear_history=self._clear_export_history)
+
     def toggle_settings(self):
-        self._settings_open = not self._settings_open
-        win = self._settings_window
-        if not self._settings_open:
-            win.withdraw()
+        if self._settings_window.is_open():
+            self._settings_window.cancel()
+            self._settings_open = False
             return
-        win.update_idletasks()
-        x = self.winfo_rootx() + max(0, (self.winfo_width() - win.winfo_reqwidth()) // 2)
-        y = self.winfo_rooty() + 90
-        win.geometry(f"+{x}+{y}")
-        win.deiconify()
-        win.lift()
-        win.after(50, self.entry_api.focus_set)
+        self._settings_open = True
+        self._settings_window.show(current=self.preferences, api_key=self.sv_api_key.get())
+        self._settings_window.set_busy(self._pipeline_running or self._has_pending_uploads() or self._connection_busy)
+
+    def _dismiss_settings_on_outside_click(self, event):
+        """Settings behaves like a popover: a click anywhere in the main window closes
+        it without saving. Clicks inside Settings or other windows are left alone."""
+        settings = self._settings_window
+        # Controls that open Settings handle their own click; it is not "outside".
+        openers = (self.btn_settings, self.btn_key_chip, self._setup_steps['key'])
+        widget = getattr(event, 'widget', None)
+        try:
+            while widget is not None and widget is not self:
+                if widget in openers:
+                    return
+                widget = widget.master
+            inside_main = event.widget.winfo_toplevel() is self
+        except (AttributeError, KeyError, tk.TclError):
+            inside_main = False
+        if inside_main and settings.is_open():
+            settings.cancel()
+            self._settings_open = False
+
+    def _save_settings(self, prefs, api_key):
+        busy = self._pipeline_running or self._has_pending_uploads() or self._connection_busy
+        if busy and (api_key != self.sv_api_key.get() or prefs['model'] != self.sv_model.get()
+                     or prefs['drive_folder_id'] != self.preferences['drive_folder_id']):
+            raise ValueError('Wait for this batch to finish before changing connections.')
+        import drive_uploader
+        prefs = dict(prefs)
+        prefs['drive_folder_id'] = drive_uploader.normalize_folder_id(prefs['drive_folder_id'])
+        previous_key = None
+        changing_key = prefs['remember_api_key'] or self.preferences['remember_api_key']
+        if changing_key:
+            previous_key = self._secret_store.get()
+        try:
+            if prefs['remember_api_key']: self._secret_store.set(api_key)
+            elif self.preferences['remember_api_key']: self._secret_store.delete()
+            saved = self._preference_store.save(prefs)
+        except Exception:
+            if changing_key:
+                try:
+                    if previous_key is None: self._secret_store.delete()
+                    else: self._secret_store.set(previous_key)
+                except Exception:
+                    messagebox.showerror('Settings', 'Settings could not be saved and secure key storage could not be restored. Check Remember API key before closing.')
+            raise
+        self.preferences = saved
+        self.sv_api_key.set(api_key)
+        self.sv_model.set(prefs['model'])
+        self._settings_open = False
+        self._apply_text_scale(prefs['text_scale'])
+        self._schedule_folder_preview()
+        self._refresh_run_state()
+
+    def _apply_text_scale(self, scale=1.0):
+        scale = 1.0
+        ctk.set_widget_scaling(scale)
+        if hasattr(self, 'tree'):
+            ttk.Style().configure('Treeview', rowheight=round(36*scale), font=('Helvetica',round(12*scale)))
+            ttk.Style().configure('Treeview.Heading', font=('Helvetica',round(12*scale),'bold'))
+            # CTk's scaling callback replays its last geometry-manager call,
+            # including widgets hidden by grid_remove. Restore intended visibility.
+            self._sync_jd_section(animate=False)
+            self._update_matching_filters()
+            self._sync_action_buttons()
+            if getattr(self, '_last_export_dir', None): self.btn_reveal.grid()
+            else: self.btn_reveal.grid_remove()
+            self._sync_skipped_link()
+            if hasattr(self, 'extracted_data'):
+                self._update_empty_state(len(self.tree.get_children("")))
+
+    def _test_ai_connection(self, api_key, model):
+        def test():
+            try:
+                client = OpenAI(api_key=api_key, timeout=20, max_retries=0)
+                # Test every model used by this workflow, including the fixed JD parser.
+                for name in dict.fromkeys([model, LUNA_MODEL]):
+                    client.chat.completions.create(model=name, messages=[{'role':'user','content':'Reply OK.'}], max_completion_tokens=16)
+                client.embeddings.create(model='text-embedding-3-small', input='connection test')
+                self._post(lambda: messagebox.showinfo('AI connection', 'Extraction, matching, JD parsing and embeddings are available.'))
+            except Exception as exc:
+                self._post(lambda m=str(exc): messagebox.showerror('AI connection', m))
+        threading.Thread(target=test,daemon=True).start()
+
+    def _reconnect_drive_account(self):
+        if self._pipeline_running or self._has_pending_uploads() or self._connection_busy: return
+        self._connection_busy = True
+        self._refresh_run_state()
+        self._settings_window.set_busy(True)
+        def reconnect():
+            try:
+                import drive_uploader
+                creds=drive_uploader.get_drive_credentials(force_reauth=True)
+                with self._drive_creds_lock:
+                    self._drive_creds=creds
+                    self._drive_auth_failed=False
+                service=drive_uploader.get_drive_service(creds=creds)
+                user=service.about().get(fields='user(emailAddress)').execute().get('user',{})
+                message=f"Drive account: {user.get('emailAddress','connected')}. Test folder access before processing."
+                def complete():
+                    self._drive_account = user.get('emailAddress','Connected')
+                self._post(complete)
+            except Exception:
+                self._post(lambda:messagebox.showerror('Drive sign-in','Could not switch Drive account. Try again in Settings.'))
+            finally:
+                self._post(self._finish_drive_connection)
+        threading.Thread(target=reconnect,daemon=True).start()
+
+    def _finish_drive_connection(self):
+        self._connection_busy = False
+        if self._settings_window.winfo_exists(): self._settings_window.set_busy(self._pipeline_running or self._has_pending_uploads())
+        self._refresh_run_state()
+
+    def _clear_analysis_cache(self):
+        if self._pipeline_running or self._has_pending_uploads():
+            messagebox.showinfo('Cache', 'Wait for the batch to finish before clearing cached analysis.')
+            return
+        if messagebox.askyesno('Clear cached analysis', 'Remove cached parsing and matching results? Saved corrections, CSV history and Drive links remain.'):
+            for path in (RESUME_CACHE_FILE, JD_CACHE_FILE):
+                if os.path.exists(path): os.remove(path)
+            self.lbl_status.configure(text='Cached analysis cleared.')
+
+    def _clear_export_history(self):
+        if messagebox.askyesno('Clear CSV history','Clear local CSV history? Existing CSV files and saved corrections remain.'):
+            self._review_store.clear_history()
+            self.lbl_status.configure(text='CSV history cleared.')
 
     def _update_connection_status(self, *_):
         # Presence is not proof of a valid connection; validation happens on use.
@@ -1811,34 +2083,81 @@ class ExtractorApp(ctk.CTk):
             self.btn_key_chip.pack_forget()
         elif not self.btn_key_chip.winfo_manager():
             self.btn_key_chip.pack(side="right", padx=12)
+        if hasattr(self, "frame_empty"):
+            self._update_empty_state(len(self.tree.get_children("")))
 
     def toggle_jd(self):
         self._jd_open = not self._jd_open
         self._sync_jd_section()
 
-    def _sync_jd_section(self):
-        """Body visible only while matching is on and expanded; collapsed shows a one-line summary."""
+    def _jd_visible(self):
+        return bool(self.bv_jd_matching.get()) and self._jd_open
+
+    def _jd_target_height(self):
+        return self.frame_jd_body.winfo_reqheight() + 12  # bottom padding inside the card
+
+    def _fit_jd_clip(self):
+        """Follow content changes (e.g. the inline error) once the box is open."""
+        if self._jd_visible() and not is_animating(self.frame_jd_clip):
+            self.frame_jd_clip.configure(height=self._jd_target_height())
+
+    def _sync_jd_section(self, animate=True):
+        """Box visible only while matching is on and open; folded shows a one-line summary."""
         enabled = self.bv_jd_matching.get()
-        if enabled and self._jd_open:
-            self.frame_jd_body.grid()
+        text = self.txt_jd.get("1.0", tk.END).strip()
+        if enabled and self._jd_open and self._jd_error_shown and not text:
+            self.lbl_jd_error.grid(row=1, column=0, sticky="ew", padx=16, pady=(6, 0))
         else:
-            self.frame_jd_body.grid_remove()
+            self.lbl_jd_error.grid_remove()
+        if self._jd_visible():
+            if self.frame_jd_body.winfo_manager() != "place":
+                self.frame_jd_body.place(x=0, y=0, relwidth=1)
+            self.frame_jd_body.update_idletasks()
+            animate_height(self.frame_jd_clip, self._jd_target_height(),
+                           MOTION_ENTER_MS if animate else 0, ease="out")
+        else:
+            animate_height(self.frame_jd_clip, 0, MOTION_EXIT_MS if animate else 0, ease="in",
+                           on_done=self.frame_jd_body.place_forget)
         if not enabled:
             summary = "Off — resumes are only parsed and uploaded"
         elif self._jd_open:
             summary = ""
+        elif text:
+            first = text.splitlines()[0].strip()
+            if len(first) > 60:
+                first = first[:59] + "…"
+            summary = f"{first} · {len(text.split())} words"
         else:
-            text = self.txt_jd.get("1.0", tk.END).strip()
-            if text:
-                first = text.splitlines()[0].strip()
-                if len(first) > 60:
-                    first = first[:59] + "…"
-                summary = f"{first} · {len(text.split())} words"
-            else:
-                summary = "No description yet"
-        self.lbl_jd_summary.configure(text=summary)
-        self.btn_jd_toggle.configure(state="normal" if enabled else "disabled",
-                                     text="Hide" if enabled and self._jd_open else "Edit")
+            summary = "No description yet — click to add one"
+        self.lbl_jd_summary.configure(text=summary,
+            text_color=WARNING_TEXT if enabled and not text and not self._jd_open else MUTED_TEXT,
+            cursor="hand2" if enabled and not self._jd_open else "")
+        self._update_jd_hint()
+
+    def _open_jd(self):
+        if self.bv_jd_matching.get() and not self._jd_open:
+            self.toggle_jd()
+
+    def _update_jd_hint(self):
+        try:
+            focus = self.focus_get()
+        except (KeyError, tk.TclError):  # Focus inside a native dialog.
+            focus = None
+        focused = focus is not None and str(focus).startswith(str(self.txt_jd))
+        if focused or self.txt_jd.get("1.0", tk.END).strip() or self.txt_jd.cget("state") == "disabled":
+            self.lbl_jd_hint.place_forget()
+        else:
+            self.lbl_jd_hint.place(x=10, y=8)
+
+    def _on_jd_edited(self):
+        if self._jd_error_shown and self.txt_jd.get("1.0", tk.END).strip():
+            self._jd_error_shown = False
+            self._sync_jd_section()
+        self._update_empty_state(len(self.tree.get_children("")))
+
+    def _jd_missing(self):
+        """Matching is on but there is nothing to match against."""
+        return self.bv_jd_matching.get() is True and not self.txt_jd.get("1.0", tk.END).strip()
 
     def toggle_activity(self):
         if self._activity_open:
@@ -1846,22 +2165,56 @@ class ExtractorApp(ctk.CTk):
             return
         self._activity_open = True
         self._update_activity_report()
-        self._activity_window.deiconify()
+        animate_window_open(self._activity_window, self.preferences["reduce_motion"])
         self._activity_window.lift()
 
     def _hide_activity(self):
         self._activity_open = False
         self._activity_window.withdraw()
 
+    def _log_activity(self, message):
+        """Timestamped event for the activity window; the run report stays below it."""
+        self._activity_log.append(f"{time.strftime('%H:%M:%S')}  {message}")
+        del self._activity_log[:-500]
+        self._update_activity_report()
+
+    def _activity_text(self):
+        events = "\n".join(self._activity_log)
+        if not events:
+            return self._processing_report
+        if self._processing_report == "No processing activity yet.":
+            return events
+        return f"{events}\n\n{self._processing_report}"
+
     def _update_activity_report(self):
         self.txt_activity.configure(state="normal")
         self.txt_activity.delete("1.0", tk.END)
-        self.txt_activity.insert("1.0", self._processing_report)
+        self.txt_activity.insert("1.0", self._activity_text())
         self.txt_activity.configure(state="disabled")
+        if self._activity_log:
+            self.txt_activity.see(tk.END)
+
+    def _show_attention_rows(self):
+        self.bv_attention.set(True)
+        self.filter_table()
+        self.lift()
 
     def toggle_table_columns(self):
         columns = tuple(self.tree.cget("columns")) if self.bv_all_columns.get() else COMPACT_COLUMNS
         self.tree.configure(displaycolumns=columns)
+
+    def _route_table_wheel(self, event, touchpad=False):
+        """Native wheel events may target window focus instead of the table."""
+        x,y=getattr(event,'x_root',-1),getattr(event,'y_root',-1)
+        def contains(widget):
+            return (widget.winfo_viewable() and
+                widget.winfo_rootx() <= x < widget.winfo_rootx()+widget.winfo_width() and
+                widget.winfo_rooty() <= y < widget.winfo_rooty()+widget.winfo_height())
+        if contains(self.scrollbar_x):
+            return self._smooth_scroll.handle_touchpad(event) if touchpad else self._smooth_scroll.handle_wheel(event,axis='x')
+        if contains(self.tree) or contains(self.scrollbar_y):
+            return self._smooth_scroll.handle_touchpad(event) if touchpad else self._smooth_scroll.handle_wheel(event)
+        return None
 
     def _set_table_yview(self, first, last):
         self.scrollbar_y.set(first, last)
@@ -1901,20 +2254,21 @@ class ExtractorApp(ctk.CTk):
         self.sv_min_score.set(SCORE_FILTERS[label])
 
     def _update_matching_filters(self):
-        # Disabled rather than hidden so the filter bar never shifts.
         enabled = self.bv_jd_matching.get()
         self.seg_min_score.configure(state="normal" if enabled else "disabled")
-        self.lbl_min_score.configure(text_color=TEXT if enabled else HINT_TEXT)
+        if enabled: self.frame_min_score.pack(side='left', padx=8, after=self.entry_search)
+        else: self.frame_min_score.pack_forget()
 
     def on_candidate_selected(self, event=None):
         self.btn_details.configure(state="normal" if self.tree.selection() else "disabled")
 
     def _idle_empty_text(self):
-        return (f"No results yet\n{SHORTCUT_KEY}O choose folder  ·  "
-                f"{SHORTCUT_KEY}{'↩' if SHORTCUT_KEY == '⌘' else 'Enter'} process")
+        return (f"No results yet\n{shortcut_label('open')} choose folder  ·  "
+                f"{shortcut_label('process')} process")
 
     def _update_empty_state(self, count):
         self.on_candidate_selected()
+        self.frame_empty.place_forget()
         if count:
             self.lbl_empty.place_forget()
             return
@@ -1923,9 +2277,98 @@ class ExtractorApp(ctk.CTk):
         elif self._pipeline_running:
             text = "Results appear here as resumes are processed."
         else:
-            text = self._idle_empty_text()
+            self.lbl_empty.place_forget()
+            self._sync_setup_steps()
+            self.frame_empty.place(relx=0.5, rely=0.56, anchor="center")
+            return
         self.lbl_empty.configure(text=text)
         self.lbl_empty.place(relx=0.5, rely=0.56, anchor="center")
+
+    def _sync_setup_steps(self):
+        matching = self.bv_jd_matching.get()
+        steps = (
+            ("key", bool(self.sv_api_key.get().strip()), "Add your OpenAI API key"),
+            ("folder", bool(getattr(self, "_preview_found", None)), "Choose a folder of resumes"),
+            ("jd", not matching or bool(self.txt_jd.get("1.0", tk.END).strip()),
+             "Paste a job description" if matching else "Job description — matching is off"),
+        )
+        for number, (key, done, label) in enumerate(steps, 1):
+            optional = "" if key != "jd" or not matching else "  (optional)"
+            self._setup_steps[key].configure(text=f"{'✓' if done else number}   {label}{optional}",
+                text_color=MUTED_TEXT if done else LINK_TEXT)
+
+    def _open_api_key_settings(self):
+        if not self._settings_window.is_open():
+            self.toggle_settings()
+        self._settings_window._select_page('Connections')
+        self.entry_api.focus_set()
+
+    def _focus_jd(self):
+        if not self.bv_jd_matching.get():
+            return
+        self._jd_open = True
+        self._sync_jd_section()
+        self.txt_jd.focus_set()
+
+    def _pref(self, key):
+        prefs = getattr(self, 'preferences', {})
+        return prefs.get(key, DEFAULT_PREFERENCES.get(key)) if isinstance(prefs,dict) else DEFAULT_PREFERENCES.get(key)
+
+    def _eligible_rows(self, filtered=False):
+        rows = self._visible_candidates if filtered else self.extracted_data
+        return get_deduplicated_candidates([r for r in rows if exportable(r, self._pref('export_missing'))])
+
+    def process_action(self):
+        if self._pipeline_running or self._has_pending_uploads() or self._connection_busy: return
+        if self._pipeline_error:
+            self.start_extraction()
+        elif any(r.get('ResumeLink') in ('Failed','Cancelled') and r.get('Parsed', True) for r in self.extracted_data):
+            self.retry_failed_uploads()
+        elif self._pipeline_finished:
+            return  # Done is an acknowledgement; Clear starts the next batch.
+        else:
+            self.start_extraction()
+
+    def _close_batch_windows(self):
+        for window in self._batch_windows:
+            if window.winfo_exists(): window.destroy()
+        self._batch_windows.clear()
+        self._details_window = None
+
+    def clear_batch(self):
+        if self._pipeline_running or self._has_pending_uploads() or self._connection_busy: return
+        self._close_batch_windows()
+        self._run_gen += 1  # Ignore callbacks from the settled batch.
+        self._preview_generation += 1
+        self._smooth_scroll.cancel()
+        self.extracted_data.clear()
+        self.candidates_by_file.clear()
+        self._visible_candidates = []
+        self._pipeline_finished = False
+        self._pipeline_error = None
+        self._processed_count = self._processing_issue_count = 0
+        self.total_uploads = self.completed_uploads = self.failed_uploads = self.cancelled_uploads = 0
+        self.uploading_files.clear()
+        self.skipped_files = []
+        self._evaluate_anyway.clear()
+        self.bv_jd_matching.set(self._pref('jd_matching_default'))
+        self._jd_open = True  # A new batch starts with the job description in view.
+        self._sync_jd_section()
+        self._update_matching_filters()
+        self._processing_report = 'No processing activity yet.'
+        self._update_activity_report()
+        self._last_export_dir = None
+        self.btn_reveal.grid_remove()
+        self.sv_search.set('')
+        self.bv_attention.set(False)
+        self.sv_min_score.set('0')
+        self.seg_min_score.set('All')
+        self._set_progress_waiting(False)
+        self._match_progress = self._shown_progress = 0
+        self.progress_bar.set(0)
+        self.filter_table()
+        self.update_upload_progress_ui()
+        self.lbl_status.configure(text='Batch cleared. Choose a folder or process the next batch.')
 
     def _has_pending_uploads(self):
         return self.total_uploads > self.completed_uploads + self.failed_uploads + self.cancelled_uploads
@@ -1933,17 +2376,22 @@ class ExtractorApp(ctk.CTk):
     def _refresh_run_state(self):
         """Main thread: pipeline completion and upload completion are separate events."""
         pending = self._has_pending_uploads()
-        busy = self._pipeline_running or pending
+        busy = self._pipeline_running or pending or getattr(self,"_connection_busy",False) is True
         self._set_source_controls("disabled" if busy else "normal")
         self.chk_jd_matching.configure(state="disabled" if busy else "normal")
-        self.btn_extract.configure(state="disabled" if busy else "normal",
-            text="Processing…" if self._pipeline_running else "Uploading…" if pending else self._start_button_text())
-        retryable = sum(row.get("ResumeLink") in ("Failed", "Cancelled") for row in self.extracted_data)
-        self.btn_retry.configure(state="normal" if retryable else "disabled",
+        failed = any(r.get('ResumeLink') in ('Failed','Cancelled') and r.get('Parsed', True) for r in self.extracted_data)
+        label = ('Connecting Drive…' if getattr(self,'_connection_busy',False) is True else 'Processing…' if self._pipeline_running else 'Uploading…' if pending else
+                 'Retry processing' if self._pipeline_error else 'Retry uploads' if failed else
+                 'Done ✓' if self._pipeline_finished else self._start_button_text())
+        self.btn_extract.configure(state='disabled' if busy or (self._pipeline_finished and not failed and not self._pipeline_error) else 'normal', text=label)
+        if hasattr(self,'btn_clear'):
+            self.btn_clear.configure(state='normal' if not busy and (self.extracted_data or self._pipeline_error or self._pipeline_finished) else 'disabled')
+        retryable = sum(row.get("ResumeLink") in ("Failed", "Cancelled") and row.get("Parsed", True) for row in self.extracted_data)
+        self.btn_retry.configure(state="normal" if retryable and getattr(self,"_connection_busy",False) is not True else "disabled",
                                  text=f"Retry {retryable} upload{'s' if retryable != 1 else ''}" if retryable else "Retry uploads")
         self.btn_cancel_uploads.configure(state="normal" if pending else "disabled")
-        eligible = get_deduplicated_candidates([
-            row for row in self.extracted_data if is_valid_candidate(row, allow_pending=False)])
+        eligible = [r for r in self.extracted_data if exportable(r, ExtractorApp._pref(self, "export_missing"))]
+        eligible = get_deduplicated_candidates(eligible)
         self.btn_export.configure(state="normal" if eligible and not self._pipeline_running else "disabled",
                                   text=f"Export CSV ({len(eligible)})" if eligible else "Export CSV")
         if self._pipeline_error:
@@ -1971,7 +2419,7 @@ class ExtractorApp(ctk.CTk):
 
     def _sync_action_buttons(self):
         """Show only usable actions. Their columns keep a minimum width, so nothing shifts."""
-        for button in (self.btn_retry, self.btn_cancel_uploads, self.btn_export):
+        for button in (self.btn_retry, self.btn_cancel_uploads, self.btn_export, self.btn_clear):
             usable = button.cget("state") == "normal"
             if usable and not button.winfo_manager():
                 button.grid()
@@ -1985,6 +2433,37 @@ class ExtractorApp(ctk.CTk):
                                       hover_color=ACCENT_HOVER if export_next else SECONDARY_HOVER)
             self.btn_extract.configure(fg_color=SECONDARY if export_next else ACCENT,
                                        hover_color=SECONDARY_HOVER if export_next else ACCENT_HOVER)
+        self._sync_progress_visibility()
+        self._sync_skipped_link()
+
+    def _sync_progress_visibility(self):
+        """The bar only appears while work is under way. It keeps its row, so nothing moves."""
+        active = bool(self._pipeline_running or self._has_pending_uploads()) if hasattr(self, "total_uploads") else False
+        if active == self._progress_shown:
+            return
+        self._progress_shown = active
+        background = self.frame_bottom.cget("fg_color")
+        track, fill = self._progress_colors if active else (background, background)
+        self.progress_bar.configure(fg_color=track, progress_color=fill)
+
+    def _skipped_for_display(self):
+        if self._pipeline_running or self._pipeline_finished or self._pipeline_error:
+            return self.skipped_files
+        return self._preview_skipped
+
+    def _sync_skipped_link(self):
+        skipped = self._skipped_for_display() if hasattr(self, "_preview_skipped") else []
+        if skipped:
+            count = len(skipped)
+            self.btn_skipped.configure(text=f"View {count} skipped file{'s' if count != 1 else ''}")
+            self.btn_skipped.grid()
+        else:
+            self.btn_skipped.grid_remove()
+
+    def show_skipped_files(self):
+        skipped = self._skipped_for_display()
+        if skipped:
+            messagebox.showinfo("Skipped files", format_skipped_files(skipped, limit=40), parent=self)
 
     def center_window(self, width, height):
         screen_width = self.winfo_screenwidth()
@@ -2007,7 +2486,7 @@ class ExtractorApp(ctk.CTk):
             return
         finished = self.completed_uploads + self.failed_uploads + self.cancelled_uploads
         value = run_progress(self._match_progress, finished, self.total_uploads,
-                             self._pipeline_running, self._run_gen > 0)
+                             self._pipeline_running, bool(self.extracted_data) or self._pipeline_finished)
         self._shown_progress = max(self._shown_progress, value)
         self._set_progress_waiting(False)
         self.progress_bar.set(self._shown_progress)
@@ -2086,11 +2565,30 @@ class ExtractorApp(ctk.CTk):
             if not self._closing:
                 self.after(10 if not self.ui_events.empty() else 100, self._drain_ui_events)
 
-    def on_close(self) -> None:
+    def on_close(self, force=False) -> None:
         """Window close: stop the drain loop, flush unsaved Drive links, then destroy.
         The resume cache is checkpointed during the run, so closing mid-run loses
         at most CACHE_CHECKPOINT_EVERY match results."""
+        if not force and (self._pipeline_running or self._has_pending_uploads()):
+            if not messagebox.askyesno('Processing in progress',
+                'Close and stop this batch? Queued uploads will stop; completed uploads and cached results remain. You can rerun the folder later.'):
+                return
         self._closing = True
+        self._uploads_cancelled_gen = self._run_gen
+        self._run_gen += 1
+        self._smooth_scroll.destroy()
+        try:
+            prefs = dict(self.preferences)
+            if prefs['reopen_last_folder']: prefs['last_folder'] = self.sv_dir.get()
+            else: prefs['last_folder'] = ''
+            if prefs['remember_workspace']:
+                prefs.update(window_geometry=self.geometry(),
+                    column_widths={col:self.tree.column(col,'width') for col in self.tree['columns']},
+                    sort_state=self._sort_state)
+            else: prefs.update(window_geometry='', column_widths={}, sort_state=None)
+            self._preference_store.save(prefs)
+        except Exception as exc:
+            print(f'Could not save workspace preferences: {exc}')
         try:
             self._save_drive_cache(force=True)
         except Exception as e:
@@ -2132,7 +2630,10 @@ class ExtractorApp(ctk.CTk):
 
     def retry_failed_uploads(self):
         """Re-queue failed and cancelled uploads of parsed candidates."""
-        failed_candidates = [row for row in self.extracted_data if row.get("ResumeLink") in ("Failed", "Cancelled")]
+        if getattr(self,"_connection_busy",False) is True: return
+        import drive_uploader
+        self._batch_drive_folder = drive_uploader.normalize_folder_id(ExtractorApp._pref(self,"drive_folder_id")) or drive_uploader.DRIVE_FOLDER_ID
+        failed_candidates = [row for row in self.extracted_data if row.get("ResumeLink") in ("Failed", "Cancelled") and row.get("Parsed", True)]
         if not failed_candidates:
             messagebox.showinfo("Retry", "No failed or cancelled uploads to retry.")
             return
@@ -2142,7 +2643,8 @@ class ExtractorApp(ctk.CTk):
         self.cancelled_uploads -= n_cancelled
         self._uploads_cancelled_gen = None
         self._shown_progress = 0.0  # Retried uploads lower the true progress again.
-        folder = self.sv_dir.get()
+        folder = getattr(self, "_batch_folder", "")
+        if not isinstance(folder,str) or not folder: folder = self.sv_dir.get()
         # Let the retry attempt Drive sign-in again, with fresh credentials (recovers a
         # revoked/expired token); workers rebuild their service when the creds change.
         with self._drive_creds_lock:  # short: sign-in never holds this lock
@@ -2183,6 +2685,7 @@ class ExtractorApp(ctk.CTk):
         for _ in range(stop_jobs):
             self.upload_queue.put(None)
         self.lbl_status.configure(text="Uploads cancelled \u2014 use Retry to upload them later.")
+        self._log_activity("Uploads cancelled")
 
     # ── UI Actions ──────────────────────────────────────────────────────────
 
@@ -2194,11 +2697,32 @@ class ExtractorApp(ctk.CTk):
         self.btn_upload_jd.configure(state=state)
         if enabled and not self.txt_jd.get("1.0", tk.END).strip():
             self._jd_open = True  # Nothing to summarise yet: open it for typing.
+        if not enabled:
+            self._jd_error_shown = False
         self._sync_jd_section()
         self._update_matching_filters()
         self.filter_table()
         if not self._pipeline_running:
             self.btn_extract.configure(text=self._start_button_text())
+
+    def toggle_fullscreen(self):
+        entering = not self.attributes("-fullscreen")
+        if sys.platform == "darwin":
+            self.attributes("-fullscreen", entering)  # AppKit animates this itself.
+        else:
+            fade_through(self, lambda: self.attributes("-fullscreen", entering), self._pref("reduce_motion"))
+        return "break"
+
+    def _process_disabled_reason(self):
+        if self._connection_busy:
+            return "Checking the Google Drive connection…"
+        if self._pipeline_running:
+            return "Resumes are being processed."
+        if self._has_pending_uploads():
+            return "Waiting for uploads to finish."
+        if self._pipeline_finished:
+            return "This batch is done. Clear batch to start another."
+        return None
 
     def _start_button_text(self):
         return "Process resumes"
@@ -2226,24 +2750,30 @@ class ExtractorApp(ctk.CTk):
         try:
             if not os.path.isdir(folder):
                 raise FileNotFoundError
-            supported, skipped = discover_resume_files(folder)
-            text = f"{len(supported)} resumes found"
+            supported, skipped = discover_resume_files(folder, recursive=ExtractorApp._pref(self, "recursive"))
+            count = len(supported)
+            text = f"{count} resume{'s' if count != 1 else ''} found"
             if skipped:
-                text += f"; {len(skipped)} unsupported files will be skipped"
+                text += f" · {len(skipped)} unsupported file{'s' if len(skipped) != 1 else ''} will be skipped"
             text += ". Click Process resumes to begin." if supported else ". Choose another folder."
         except FileNotFoundError:
-            text = "Folder not found. Choose a resume folder to begin."
+            text, supported, skipped = "Folder not found. Choose a resume folder to begin.", [], []
         except OSError as exc:
-            text = f"Could not read folder: {exc}"
-        self._post(lambda message=text: self._show_folder_preview(generation, message))
+            text, supported, skipped = f"Could not read folder: {exc}", [], []
+        self._post(lambda message=text, found=len(supported), skip=list(skipped):
+                   self._show_folder_preview(generation, message, skip, found))
 
-    def _show_folder_preview(self, generation, message):
+    def _show_folder_preview(self, generation, message, skipped=None, found=None):
         if not self._closing and generation == self._preview_generation:
+            self._preview_skipped = list(skipped or [])
+            self._preview_found = found
             self._show_idle_status(message)
+            self._sync_skipped_link()
+            self._update_empty_state(len(self.tree.get_children("")))
 
     def _show_idle_status(self, text):
         """Folder feedback shares the status line, but never replaces a run's progress."""
-        if not (self._pipeline_running or self._has_pending_uploads()):
+        if not (self._pipeline_running or self._has_pending_uploads() or self._pipeline_finished or self._pipeline_error):
             self.lbl_status.configure(text=text)
 
     def _set_source_controls(self, state):
@@ -2264,7 +2794,9 @@ class ExtractorApp(ctk.CTk):
             if text:
                 self.txt_jd.delete("1.0", tk.END)
                 self.txt_jd.insert("1.0", text)
+                self._jd_error_shown = False
                 self._sync_jd_section()
+                self._update_empty_state(len(self.tree.get_children("")))
             else:
                 messagebox.showerror("Error", "Could not read the JD file.")
 
@@ -2300,10 +2832,9 @@ class ExtractorApp(ctk.CTk):
         data = [(self.tree.set(child, col), child) for child in self.tree.get_children("")]
 
         def num_key(item):
-            try:
-                return float(str(item[0]).strip())
-            except ValueError:
-                return 0.0
+            # Placeholders such as "—" sort below every real value.
+            value = as_percent(item[0])
+            return -1.0 if value is None else value
 
         if numeric:
             data.sort(key=num_key, reverse=descending)
@@ -2334,7 +2865,12 @@ class ExtractorApp(ctk.CTk):
         # export is limited to valid, uploaded candidates. Duplicates are merged.
         deduped_cands = get_deduplicated_candidates(self.extracted_data)
 
+        attention_count = sum(bool(attention_reasons(r)) for r in deduped_cands)
+        if hasattr(self,'chk_attention'):
+            self.chk_attention.configure(text=f'Needs attention ({attention_count})')
         for row in deduped_cands:
+            if hasattr(self,'bv_attention') and self.bv_attention.get() is True and not attention_reasons(row):
+                continue
             if safe_match_percentage(row) < min_score:
                 continue
 
@@ -2361,6 +2897,10 @@ class ExtractorApp(ctk.CTk):
             self.tree.selection_set(restore)
         if self.tree.get_children(""):
             self.tree.yview_moveto(saved_first)
+        self._visible_candidates = [r for r in deduped_cands if r.get('SourceFilename') in wanted]
+        if hasattr(self, 'lbl_result_count'):
+            merged = len(self.extracted_data)-len(deduped_cands)
+            self.lbl_result_count.configure(text=f'{len(visible)} shown · {len(deduped_cands)} total' + (f' · {merged} duplicate{"s" if merged != 1 else ""} merged' if merged else ''))
         self._update_empty_state(len(visible))
 
     def on_row_double_click(self, event):
@@ -2368,7 +2908,7 @@ class ExtractorApp(ctk.CTk):
         if not item: return
 
         iid = item[0]
-        data = self.candidates_by_file.get(iid)
+        data = next((r for r in merge_duplicates(self.extracted_data) if r.get("SourceFilename") == iid), None)
         if data is None:
             # Rows without SourceFilename have tree-generated iids: fall back to email
             values = self.tree.item(iid, "values")
@@ -2383,6 +2923,7 @@ class ExtractorApp(ctk.CTk):
         win = self._details_window
         if win is None or not win.winfo_exists():
             win = self._details_window = ctk.CTkToplevel(self)
+            self._batch_windows.append(win)
             win.geometry("620x700")
             win.minsize(500, 440)
             win.transient(self)
@@ -2391,7 +2932,7 @@ class ExtractorApp(ctk.CTk):
             for child in win.winfo_children():
                 child.destroy()
         win.title(f"Candidate details — {data.get('Name', '')}")
-        win.deiconify()
+        animate_window_open(win, self._pref("reduce_motion"))
         win.lift()
 
         frame = ctk.CTkScrollableFrame(win, fg_color="transparent")
@@ -2404,8 +2945,10 @@ class ExtractorApp(ctk.CTk):
                      font=ctk.CTkFont(size=20, weight="bold")).pack(side="left")
         score = as_percent(data.get("MatchPercentage"))
         if score is not None:
-            ctk.CTkLabel(header, text=f"{score:.0f}% match", width=110, height=28, corner_radius=14,
-                         fg_color=ACCENT, text_color="#FFFFFF",
+            # The tier word carries the meaning; colour only reinforces it.
+            tier, colour = match_tier(score)
+            ctk.CTkLabel(header, text=f"{score:.0f}% · {tier}", width=130, height=28, corner_radius=14,
+                         fg_color=colour, text_color="#FFFFFF",
                          font=ctk.CTkFont(weight="bold")).pack(side="right")
         years = data.get("YearsOfExperience")
         upload = upload_status_display(data.get("ResumeLink"))[0]
@@ -2421,24 +2964,56 @@ class ExtractorApp(ctk.CTk):
                                                         ("Status", "Status", False),
                                                         ("Source file", "SourceFilename", False))):
             value = str(data.get(key) or "—")
+            shown = format_phone_display(value) if key == "Phone" else value
             ctk.CTkLabel(facts, text=label, text_color=MUTED_TEXT, width=90, anchor="w").grid(
                 row=index, column=0, sticky="w", pady=2)
-            ctk.CTkLabel(facts, text=value, anchor="w", justify="left", wraplength=380).grid(
+            ctk.CTkLabel(facts, text=shown, anchor="w", justify="left", wraplength=380).grid(
                 row=index, column=1, sticky="w", pady=2)
             if copyable and value != "—":
-                button = ctk.CTkButton(facts, text="Copy", width=60, height=26, fg_color="transparent",
+                button = ctk.CTkButton(facts, text="Copy", width=80, height=36, fg_color="transparent",
                                        hover_color=SECONDARY, text_color=LINK_TEXT)
                 button.configure(command=lambda b=button, v=value: self._copy_to_clipboard(b, v))
                 button.grid(row=index, column=2, sticky="e")
 
-        actions = ctk.CTkFrame(frame, fg_color="transparent")
-        actions.pack(fill="x", pady=(12, 4))
+        # One row of actions; an empty frame would otherwise keep its default height.
+        tools = ctk.CTkFrame(frame, fg_color='transparent')
+        tools.pack(fill='x', pady=(12, 8))
         resume_url = data.get("ResumeDriveURL") or data.get("ResumeLink", "")
         linkedin_url = data.get("linkedin_url", "")
+        # Links that do not exist are left out rather than shown disabled.
         for label, url in (("Open resume", resume_url), ("Open LinkedIn", linkedin_url)):
-            enabled = isinstance(url, str) and url.startswith(("https://", "http://"))
-            secondary_button(actions, text=label, width=130, state="normal" if enabled else "disabled",
-                command=lambda target=url: webbrowser.open(target)).pack(side="left", padx=(0, 8))
+            if isinstance(url, str) and url.startswith(("https://", "http://")):
+                secondary_button(tools, text=label, width=130,
+                    command=lambda target=url: webbrowser.open(target)).pack(side="left", padx=(0, 8))
+
+        busy = self._pipeline_running or self._has_pending_uploads()
+        edit_reason = ("Editing is available once processing and uploads finish." if busy else
+                       None if parsed_candidate(data) else "This file could not be read, so there are no fields to edit.")
+        edit = secondary_button(tools,text='Edit fields',width=130, state='disabled' if edit_reason else 'normal',
+            command=lambda:self.edit_candidate(data))
+        edit.pack(side='left',padx=(0,8))
+        Tooltip(edit, edit_reason)
+        source_path = os.path.join(self._batch_folder or self.sv_dir.get(),data.get('SourceFilename',''))
+        secondary_button(tools,text='Open source',width=130,
+            command=lambda:reveal_in_file_manager(source_path)).pack(side='left',padx=(0,8))
+        if data.get('MatchPercentage') == 'Not evaluated' or not parsed_candidate(data) or data.get('ExtractionError'):
+            secondary_button(tools,text='Evaluate anyway' if data.get('MatchPercentage') == 'Not evaluated' else 'Retry processing',width=150,
+                state='disabled' if self._pipeline_running or self._has_pending_uploads() else 'normal',
+                command=lambda generation=self._run_gen:self.retry_candidate(data,generation)).pack(side='left')
+        elif data.get('ResumeLink') in ('Failed','Cancelled'):
+            secondary_button(tools,text='Retry upload',width=130,command=self.retry_failed_uploads).pack(side='left')
+        reasons = attention_reasons(data)
+        if edit_reason:
+            ctk.CTkLabel(frame, text=edit_reason, text_color=HINT_TEXT, anchor='w').pack(fill='x')
+        if reasons:
+            ctk.CTkLabel(frame,text='Needs attention: '+ '; '.join(reasons),text_color=WARNING_TEXT,
+                wraplength=540,justify='left',anchor='w').pack(fill='x',pady=8)
+        if data.get('EditedFields'):
+            ctk.CTkLabel(frame,text='Edited: '+', '.join(data['EditedFields']),text_color=LINK_TEXT,anchor='w').pack(fill='x')
+        sources = data.get('MergedSources',[])
+        if len(sources)>1:
+            ctk.CTkLabel(frame,text='Merged source files: '+', '.join(sources),text_color=MUTED_TEXT,
+                wraplength=540,justify='left',anchor='w').pack(fill='x',pady=8)
 
         def heading(text):
             ctk.CTkLabel(frame, text=text, font=ctk.CTkFont(weight="bold"), anchor="w").pack(
@@ -2469,29 +3044,108 @@ class ExtractorApp(ctk.CTk):
             font = ctk.CTkFont(family="Menlo" if sys.platform == "darwin" else "Consolas", size=11) if mono else None
             ctk.CTkLabel(frame, text=value, wraplength=540, justify="left", anchor="w", font=font).pack(fill="x")
 
+        # Gaps come before strengths: they decide whether a candidate goes forward.
         section("Summary", data.get("Summary"))
+        section("Missing requirements", data.get("MissingRequirements"))
         section("Strengths", data.get("Strengths"))
         section("Weaknesses", data.get("Weaknesses"))
-        section("Missing requirements", data.get("MissingRequirements"))
         evidence = data.get("SkillEvidence") or []
         section("Skill evidence", "\n".join(evidence) if isinstance(evidence, list) else evidence, mono=True)
 
-    def _copy_to_clipboard(self, button, value):
+    def retry_candidate(self, row, generation=None):
+        if generation is not None and generation != self._run_gen: return
+        filename = row.get('SourceFilename')
+        current = self.candidates_by_file.get(filename)
+        if current is None or current.get('FileHash') != row.get('FileHash'): return
+        if self._pipeline_running or self._has_pending_uploads() or self._connection_busy: return
+        filename = row.get('SourceFilename')
+        if not filename: return
+        self._evaluate_anyway.add(filename)
+        self._reuse_uploads = {filename: (row.get('FileHash'),row.get('ResumeDriveURL'))} if row.get('ResumeLink')=='Uploaded' else {}
+        self._pipeline_running = True
+        self._pipeline_finished = False
+        self._pipeline_error = None
+        self._reset_progress()
+        self._refresh_run_state()
+        # Same generation and destination: existing batch rows and uploads stay intact.
+        threading.Thread(target=self.extraction_thread,
+            args=(self._batch_folder,[filename],[],self._batch_jd,self.sv_api_key.get(),self._batch_model),
+            kwargs={'run_gen':self._run_gen},daemon=True).start()
+
+    def edit_candidate(self, data):
+        if self._pipeline_running or self._has_pending_uploads() or self._connection_busy: return
+        win = ctk.CTkToplevel(self)
+        self._batch_windows.append(win)
+        generation = self._run_gen
+        win.title('Edit candidate fields')
+        win.transient(self)
+        body = ctk.CTkFrame(win,fg_color='transparent')
+        body.pack(fill='both',expand=True,padx=24,pady=20)
+        entries = {}
+        for i,(label,key) in enumerate([('Name','Name'),('Email','Email'),('Phone','Phone'),('Country','Country'),('Experience (years)','YearsOfExperience')]):
+            ctk.CTkLabel(body,text=label,anchor='w').grid(row=i,column=0,sticky='w',pady=6)
+            entry=ctk.CTkEntry(body,width=300,height=36)
+            entry.insert(0, str(clean_field(data.get(key,''))))
+            entry.grid(row=i,column=1,padx=(12,0),pady=6)
+            entries[key]=entry
+        error=ctk.CTkLabel(body,text='',text_color=DANGER_TEXT,wraplength=450)
+        error.grid(row=5,column=0,columnspan=2)
+        def save():
+            if generation != self._run_gen or data.get('SourceFilename') not in self.candidates_by_file:
+                if win.winfo_exists(): win.destroy()
+                return
+            try:
+                values={k:e.get().strip() for k,e in entries.items()}
+                if values['Email'] and not re.match(r'^[^@\s]+@[^@\s]+\.[^@\s]+$',values['Email']):
+                    raise ValueError('Enter a valid email or leave it blank.')
+                if values['YearsOfExperience']:
+                    years=float(values['YearsOfExperience'])
+                    if not math.isfinite(years) or years<0: raise ValueError('Experience must be a positive number or zero.')
+                filename=data['SourceFilename']
+                source=os.path.join(self._batch_folder or self.sv_dir.get(),filename)
+                file_hash=data.get('FileHash') or get_file_hash(source)
+                self._review_store.correct(file_hash,values)
+                target=self.candidates_by_file[filename]
+                target.update(values,FileHash=file_hash,EditedFields=list(values))
+                target['Parsed']=True
+                if all(clean_field(target.get(k)) != '' for k in values) and target.get('ResumeLink')=='Not uploaded':
+                    target.update(Status='Edited · parsed',ResumeLink='Pending')
+                    self.total_uploads+=1
+                    self.upload_queue.put((self._run_gen,filename,source,file_hash))
+                self._table_dirty=True
+                self._refresh_run_state()
+                self.filter_table()
+                win.destroy()
+                self.show_candidate_details(self._review_store.apply(target))
+            except (ValueError,OSError) as exc: error.configure(text=str(exc))
+        buttons=ctk.CTkFrame(body,fg_color='transparent')
+        buttons.grid(row=6,column=0,columnspan=2,sticky='e',pady=(12,0))
+        secondary_button(buttons,text='Cancel',width=120,command=win.destroy).pack(side='left',padx=8)
+        ctk.CTkButton(buttons,text='Save edits',width=120,height=36,command=save).pack(side='left')
+        win.bind('<Escape>',lambda e:win.destroy())
+        win.grab_set()
+        animate_window_open(win,self._pref('reduce_motion'))
+
+    def _copy_to_clipboard(self, button, value, label="Copy"):
         self.clipboard_clear()
         self.clipboard_append(value)
         button.configure(text="Copied")
-        button.after(1200, lambda: button.winfo_exists() and button.configure(text="Copy"))
+        button.after(1200, lambda: button.winfo_exists() and button.configure(text=label))
 
     # ── Extraction Logic ────────────────────────────────────────────────────
 
     def start_extraction(self, automatic=False):
-        if self._pipeline_running is True or self._closing is True or self._has_pending_uploads() is True:
+        if self._pipeline_running is True or self._closing is True or self._has_pending_uploads() is True or getattr(self,"_connection_busy",False) is True:
+            return
+        try:
+            import drive_uploader
+            drive_uploader.normalize_folder_id(ExtractorApp._pref(self,'drive_folder_id'))
+        except ValueError as exc:
+            self.lbl_status.configure(text=str(exc))
             return
         api_key = self.sv_api_key.get().strip()
         if not api_key:
-            if not self._settings_open:
-                self.toggle_settings()
-            self.entry_api.focus_set()
+            self._open_api_key_settings()
             self.lbl_status.configure(text="Add your OpenAI API key in Settings to process resumes.")
             return
 
@@ -2499,6 +3153,14 @@ class ExtractorApp(ctk.CTk):
         if not folder:
             if not automatic:
                 messagebox.showerror("Error", "Please choose a resumes folder.")
+            return
+        if self._jd_missing() is True:
+            # Matching silently turning off would surprise; ask for the missing input next to its field.
+            self._jd_error_shown = True
+            self._jd_open = True
+            self._sync_jd_section()
+            self.txt_jd.focus_set()
+            self.lbl_status.configure(text="Add a job description to match against, or untick matching.")
             return
 
         jd_text = self.txt_jd.get("1.0", tk.END).strip() if self.bv_jd_matching.get() else ""
@@ -2517,7 +3179,7 @@ class ExtractorApp(ctk.CTk):
     def _discover_resume_folder(self, folder, jd_text, api_key, model, automatic):
         """Worker thread: keep directory/network I/O away from Tk."""
         try:
-            supported_files, skipped_files = discover_resume_files(folder)
+            supported_files, skipped_files = discover_resume_files(folder, recursive=ExtractorApp._pref(self, "recursive"))
         except OSError as exc:
             self._post(lambda msg=f"Could not read resumes folder: {exc}": self._folder_load_failed(msg, automatic))
             return
@@ -2537,9 +3199,17 @@ class ExtractorApp(ctk.CTk):
         """Main thread: initialise a run after background discovery completes."""
         if self._closing is True:
             return
+        self._close_batch_windows()
         # New run: upload jobs/events from earlier runs no longer match _run_gen
         self._run_gen += 1
         run_gen = self._run_gen
+        self._batch_folder = folder
+        self._batch_jd = jd_text
+        self._batch_model = model
+        self._reuse_uploads = {}
+        self._batch_matching_enabled = bool(jd_text)
+        import drive_uploader
+        self._batch_drive_folder = drive_uploader.normalize_folder_id(ExtractorApp._pref(self,'drive_folder_id')) or drive_uploader.DRIVE_FOLDER_ID
 
         self.btn_extract.configure(state="disabled", text="Processing…")
         self.btn_export.configure(state="disabled")
@@ -2554,9 +3224,10 @@ class ExtractorApp(ctk.CTk):
         self._processed_count = 0
         self._processing_issue_count = 0
         self._processing_report = "Processing resumes. Detailed statistics will be available when processing finishes."
-        self._update_activity_report()
-        if self._settings_open:
-            self.toggle_settings()
+        self._log_activity(f"Started processing {len(supported_files)} resumes from {folder}")
+        if self._settings_window.is_open():
+            self._settings_window.cancel()
+        self._settings_open = False
         if self._jd_open:
             self.toggle_jd()
         self._reset_progress()
@@ -2614,7 +3285,7 @@ class ExtractorApp(ctk.CTk):
         # A slow Word document or network file must not leave the table empty.
         for filename in files:
             self._post(lambda f=filename: self.add_or_update_candidate(
-                {"SourceFilename": f, "Name": f, "Status": "Reading…", "ResumeLink": "",
+                {"SourceFilename": f, "Name": f, "Status": "Reading…", "Parsed": False, "ResumeLink": "",
                  "MatchPercentage": ""}))
         
         read_time = 0
@@ -2778,9 +3449,9 @@ class ExtractorApp(ctk.CTk):
                 if resume["clean_text"] is None:
                     error_row = self.create_error_row(filename, {}, "Read Error")
                     error_row["Status"] = "Read Error"
-                    error_row["ResumeLink"] = "Failed"
+                    error_row["ResumeLink"] = "Not uploaded"
+                    error_row["Parsed"] = False
                     self._post(lambda r=error_row: self.add_or_update_candidate(r))
-                    self._post(lambda: self._record_upload_counts(total=1, failed=1))
                     
                     self.processing_records.append({
                         "filename": filename,
@@ -2793,7 +3464,7 @@ class ExtractorApp(ctk.CTk):
                     continue
                 # Every readable file gets a table row now; extraction fills it in
                 self._post(lambda f=filename: self.add_or_update_candidate(
-                    {"SourceFilename": f, "Name": f, "Status": "Parsing\u2026", "ResumeLink": "",
+                    {"SourceFilename": f, "Name": f, "Status": "Parsing\u2026", "Parsed": False, "ResumeLink": "",
                      "MatchPercentage": ""}))
                 if file_hash in resume_cache:
                     cached = resume_cache[file_hash]
@@ -2843,7 +3514,7 @@ class ExtractorApp(ctk.CTk):
             candidates_to_extract = []   # valid, unfiltered candidates: uploaded and scored
 
             def is_invalid_value(val):
-                return not val or str(val).strip() in ("", "Not Found", "API Error", "Read Error", "Filtered", "None")
+                return val is None or str(val).strip() in ("", "Not Found", "API Error", "Read Error", "Filtered", "None")
 
             def finalize_candidate(resume):
                 """Loop thread: validate one extracted resume, show its row and, for a
@@ -2863,11 +3534,14 @@ class ExtractorApp(ctk.CTk):
                     }
                     print(f"[Data Quality] Candidate from file {filename} removed. Reason: Extraction Failure")
                     failed_row = self.create_error_row(filename, {}, "API Error")
-                    failed_row.update({"Status": "Extraction Failed", "ResumeLink": "Not uploaded", "MatchPercentage": "N/A"})
+                    failed_row.update({"Status": "Extraction Failed", "ResumeLink": "Not uploaded", "MatchPercentage": "N/A", "Parsed": False})
                     self._post(lambda r=failed_row: self.add_or_update_candidate(r))
                     return
 
                 filepath = os.path.join(folder, filename)
+                review = getattr(self, '_review_store', None)
+                if isinstance(review,ReviewStore):
+                    cand_data = review.apply(dict(cand_data,FileHash=resume['file_hash']))
                 normalized_cand, reason = normalize_and_validate_candidate(cand_data, resume["clean_text"], filepath=filepath)
 
                 email_found = "No" if is_invalid_value(normalized_cand.get("Email")) else "Yes"
@@ -2893,14 +3567,14 @@ class ExtractorApp(ctk.CTk):
                     # Shown with what was parsed, but not uploaded or exported
                     removed_row = dict(normalized_cand)
                     removed_row.update({"SourceFilename": filename, "Status": reason, "ResumeLink": "Not uploaded",
-                                        "MatchPercentage": "N/A"})
+                                        "MatchPercentage": "N/A", "Parsed": True, "FileHash": resume["file_hash"]})
                     if cand_data.get("ExtractionError"):
                         removed_row["Status"] = f"AI unavailable · {reason}"
                         removed_row["Summary"] = cand_data["ExtractionError"]
                     self._post(lambda r=removed_row: self.add_or_update_candidate(r))
                     return
 
-                normalized_cand["SourceFilename"] = filename
+                normalized_cand.update(SourceFilename=filename, FileHash=resume["file_hash"], Parsed=True)
                 extracted_candidate_data[filename] = normalized_cand
                 records_by_file[filename] = {
                     "filename": filename,
@@ -2912,16 +3586,13 @@ class ExtractorApp(ctk.CTk):
                 }
 
                 # Similarity pre-filter applies only to valid candidates
-                if parsed_jd and resume.get("similarity", 1.0) < 0.20:
-                    filtered_row = {
-                        "Name": "Filtered", "Email": "Filtered", "Phone": "Filtered", 
-                        "Country": "Filtered", "YearsOfExperience": "Filtered", 
-                        "SourceFilename": filename, "ResumeLink": "Failed",
-                        "MatchPercentage": 0, "Status": "Filtered (low JD similarity)",
-                        "Summary": f"Auto-filtered: similarity {resume.get('similarity', 1.0):.2f}"
-                    }
+                if parsed_jd and resume.get("similarity", 1.0) < 0.20 and filename not in getattr(self, "_evaluate_anyway", set()):
+                    filtered_row = dict(normalized_cand)
+                    filtered_row.update(SourceFilename=filename, ResumeLink='Not uploaded',
+                        MatchPercentage='Not evaluated', Status='Not evaluated', Parsed=True,
+                        FileHash=resume['file_hash'],
+                        Summary=f"JD similarity {resume.get('similarity', 1.0):.2f}. Choose Evaluate anyway to score and upload.")
                     self._post(lambda r=filtered_row: self.add_or_update_candidate(r))
-                    self._post(lambda: self._record_upload_counts(total=1, failed=1))
                     return
                 candidates_to_extract.append(resume)
 
@@ -2933,8 +3604,11 @@ class ExtractorApp(ctk.CTk):
                 if cand_data.get("ExtractionError"):
                     early_row["Status"] = "Parsed (AI unavailable)"
                 self._post(lambda r=early_row: self.add_or_update_candidate(r))
-                self._post(lambda: self._record_upload_counts(total=1))
-                self.upload_queue.put((run_gen, filename, filepath, resume["file_hash"]))
+                reuse = getattr(self,'_reuse_uploads',{})
+                uploaded = isinstance(reuse,dict) and reuse.get(filename) and reuse[filename][0] == resume['file_hash']
+                if not uploaded:
+                    self._post(lambda: self._record_upload_counts(total=1))
+                    self.upload_queue.put((run_gen, filename, filepath, resume["file_hash"]))
 
             def safe_finalize(resume):
                 """One candidate's validation error must never abort the run."""
@@ -3259,7 +3933,7 @@ Years of Experience: {cand_data.get('YearsOfExperience')}
                     if not isinstance(cand_data, dict):
                         cand_data = {"SourceFilename": filename}
                     cand_data.update({
-                        "MatchPercentage": 0, "TechnicalMatch": 0, "ExperienceMatch": 0, "DomainMatch": 0,
+                        "MatchPercentage": "Not evaluated", "TechnicalMatch": None, "ExperienceMatch": None, "DomainMatch": None,
                         "Strengths": [], "Weaknesses": [], "MissingRequirements": [],
                         "Summary": f"Evaluation Failed: {e}", "SkillEvidence": []
                     })
@@ -3324,6 +3998,7 @@ Years of Experience: {cand_data.get('YearsOfExperience')}
         self._status_dirty = False
         self._pipeline_error = message
         self._processing_report = f"Processing failed: {message}"
+        self._log_activity(f"Processing failed: {message}")
         self._pipeline_stopped()
         self._refresh_run_state()
         self._update_activity_report()
@@ -3364,7 +4039,7 @@ Years of Experience: {cand_data.get('YearsOfExperience')}
             "SourceFilename": filename, "ResumeLink": "Failed", "Status": msg,
             "MatchPercentage": "Error",
             "MissingRequirements": [], "Strengths": [], "Weaknesses": [],
-            "Summary": msg, "SkillEvidence": []
+            "Summary": msg, "SkillEvidence": [], "Parsed": False
         }
 
     def add_to_tree(self, row):
@@ -3381,7 +4056,7 @@ Years of Experience: {cand_data.get('YearsOfExperience')}
             row.get("Phone", ""),
             row.get("Country", ""),
             row.get("YearsOfExperience", ""),
-            row.get("MatchPercentage", ""),
+            match_display(row.get("MatchPercentage")),
             missing_str,
             upload_text,
         )
@@ -3398,6 +4073,9 @@ Years of Experience: {cand_data.get('YearsOfExperience')}
 
     def add_or_update_candidate(self, candidate_data):
         """Main thread only. Background threads must go through _post()."""
+        review = getattr(self, '_review_store', None)
+        if isinstance(review, ReviewStore):
+            candidate_data = review.apply(candidate_data)
         filename = candidate_data.get("SourceFilename")
         if not filename:
             self.extracted_data.append(candidate_data)
@@ -3409,13 +4087,17 @@ Years of Experience: {cand_data.get('YearsOfExperience')}
 
         if existing is not None:
             old_link = existing.get("ResumeLink", "Pending...")
+            old_url = existing.get("ResumeDriveURL", "")
+            same_source = not candidate_data.get("FileHash") or not existing.get("FileHash") or candidate_data["FileHash"] == existing["FileHash"]
             new_link = candidate_data.get("ResumeLink")
             
             existing.update(candidate_data)
+            if isinstance(review, ReviewStore): existing.update(review.apply(existing))
             
-            if not new_link or new_link == "Pending":
+            if same_source and (not new_link or new_link == "Pending"):
                 if old_link not in ("Pending", ""):
                     existing["ResumeLink"] = old_link
+                    existing["ResumeDriveURL"] = old_url
             
             print(f"[Logging] Candidate updated: {filename}")
         else:
@@ -3567,6 +4249,9 @@ Years of Experience: {cand_data.get('YearsOfExperience')}
                 try:
                     if file_hash is None:
                         file_hash = drive_uploader.get_file_hash(filepath)
+                    destination = getattr(self, '_batch_drive_folder', '')
+                    if isinstance(destination,str) and destination:
+                        file_hash = destination + ':' + file_hash
                     link, claim = self._claim_upload(file_hash)
                 except Exception as e:
                     print(f"[-] Error checking cache/hash for {filename}: {e}")
@@ -3599,8 +4284,11 @@ Years of Experience: {cand_data.get('YearsOfExperience')}
                     service = drive_uploader.get_drive_service(creds=creds)
                     service_creds = creds
 
+                destination = getattr(self, '_batch_drive_folder', '')
+                options = {'parent_id': destination} if isinstance(destination,str) and destination else {}
                 link = drive_uploader._upload_single_file(
-                    service, filepath, should_cancel=lambda g=gen: g == self._uploads_cancelled_gen)
+                    service, filepath, should_cancel=lambda g=gen: g == self._uploads_cancelled_gen or getattr(self,'_closing',False) is True,
+                    **options)
                 if not link:
                     raise ValueError("No link returned from Drive upload")
                 if file_hash:
@@ -3650,6 +4338,7 @@ Years of Experience: {cand_data.get('YearsOfExperience')}
         self.uploading_files.discard(filename)
         self.completed_uploads += 1
         row["ResumeLink"] = "Uploaded"
+        row.pop("UploadError", None)
         row["ResumeDriveURL"] = link
         self._table_dirty = True
         self._progress_dirty = True
@@ -3663,6 +4352,8 @@ Years of Experience: {cand_data.get('YearsOfExperience')}
         self.uploading_files.discard(filename)
         self.failed_uploads += 1
         row["ResumeLink"] = "Failed"
+        row["UploadError"] = str(error)
+        self._log_activity(f"Upload failed: {filename} — {error}")
         self._table_dirty = True
         self._progress_dirty = True
 
@@ -3689,7 +4380,7 @@ Years of Experience: {cand_data.get('YearsOfExperience')}
         secs = elapsed % 60
         formatted_time = f"{mins}m {secs}s"
         
-        self._processed_count = processed_count
+        self._processed_count = max(processed_count, len(self.extracted_data))
         self._pipeline_finished = True
         self._processing_issue_count = sum(
             not is_valid_candidate(row, allow_pending=True)
@@ -3817,7 +4508,7 @@ Years of Experience: {cand_data.get('YearsOfExperience')}
 
         # Keep the full report available on demand; completion never opens a modal.
         self._processing_report = popup_msg
-        self._update_activity_report()
+        self._log_activity(f"Processing finished — {self._processed_count} processed")
         self._refresh_run_state()
         if self._table_dirty:
             self._table_dirty = False
@@ -3832,154 +4523,148 @@ Years of Experience: {cand_data.get('YearsOfExperience')}
         self.open_final_export_dialog()
 
     def open_final_export_dialog(self):
-        # 1. Filter out invalid candidates (do not allow pending/uploading for export)
-        valid_candidates = [row for row in self.extracted_data if is_valid_candidate(row, allow_pending=False)]
-        # 2. Deduplicate valid candidates
-        deduped_candidates = get_deduplicated_candidates(valid_candidates)
-
-        if not deduped_candidates:
-            messagebox.showwarning("Warning", "No valid candidates found for Final CSV export.")
+        all_rows = self._eligible_rows()
+        filtered_rows = self._eligible_rows(filtered=True)
+        if not all_rows:
+            messagebox.showwarning('Export CSV','No settled, eligible candidates to export. Review Needs attention or enable Export Missing too in Settings.')
             return
-
+        regular = self._pref('regular_export')
+        matched = self._batch_matching_enabled
         dialog = ctk.CTkToplevel(self)
-        dialog.title("Export CSV")
+        self._batch_windows.append(dialog)
+        generation = self._run_gen
+        dialog.title('Export CSV')
         dialog.transient(self)
         dialog.resizable(False, False)
-        body = ctk.CTkFrame(dialog, fg_color="transparent")
-        body.pack(fill="both", expand=True, padx=24, pady=20)
-        body.grid_columnconfigure(1, weight=1)
-
-        count = len(deduped_candidates)
-        ctk.CTkLabel(body, text=f"Export {count} candidate{'s' if count != 1 else ''}", anchor="w",
-                     font=ctk.CTkFont(size=18, weight="bold")).grid(row=0, column=0, columnspan=2, sticky="w")
-        ctk.CTkLabel(body, text="Uploaded, valid candidates only. Files hold up to 99 rows each.",
-                     text_color=MUTED_TEXT, anchor="w").grid(row=1, column=0, columnspan=2, sticky="w", pady=(2, 16))
-
-        ctk.CTkLabel(body, text="Job ID", anchor="w").grid(row=2, column=0, sticky="w")
-        entry_job_id = ctk.CTkEntry(body, placeholder_text="e.g. JOB_101", width=260, height=36)
-        entry_job_id.grid(row=2, column=1, sticky="ew", padx=(16, 0))
-        lbl_error = ctk.CTkLabel(body, text="", text_color=DANGER_TEXT, anchor="w", height=20)
-        lbl_error.grid(row=3, column=1, sticky="w", padx=(16, 0))
-
-        # Optional fields stay out of the way until asked for.
-        frame_more = ctk.CTkFrame(body, fg_color="transparent")
-        frame_more.grid_columnconfigure(1, weight=1)
-        fields = {}
-        for index, (key, label, hint) in enumerate((("rate", "Expected rate", "e.g. $50/hr"),
-                                                    ("weeks", "Availability (weeks)", "e.g. 2"),
-                                                    ("notes", "Notes", "e.g. Strong matching resume"))):
-            ctk.CTkLabel(frame_more, text=label, anchor="w").grid(row=index, column=0, sticky="w", pady=4)
-            fields[key] = ctk.CTkEntry(frame_more, placeholder_text=hint, height=32)
-            fields[key].grid(row=index, column=1, sticky="ew", padx=(16, 0), pady=4)
-        ctk.CTkLabel(frame_more, text="Full time", anchor="w").grid(row=3, column=0, sticky="w", pady=4)
-        option_full_time = ctk.CTkSegmentedButton(frame_more, values=["Yes", "No"], height=30)
-        option_full_time.set("Yes")
-        option_full_time.grid(row=3, column=1, sticky="w", padx=(16, 0), pady=4)
-
-        btn_more = ctk.CTkButton(body, text="More options ▸", width=120, height=28, anchor="w",
-                                 fg_color="transparent", hover_color=SECONDARY, text_color=LINK_TEXT)
-
+        body = ctk.CTkFrame(dialog,fg_color='transparent')
+        body.pack(fill='both',expand=True,padx=24,pady=20)
+        body.grid_columnconfigure(1,weight=1)
+        ctk.CTkLabel(body,text='Regular export' if regular else 'Export CSV',anchor='w',
+            font=ctk.CTkFont(size=18,weight='bold')).grid(row=0,column=0,columnspan=2,sticky='w')
+        mode = ('Candidate fields only' + (' · Match % included' if matched else '') if regular else 'Standard 13-column format')
+        ctk.CTkLabel(body,text=mode+' · Up to 99 rows per file',text_color=MUTED_TEXT,
+            anchor='w').grid(row=1,column=0,columnspan=2,sticky='w',pady=(2,12))
+        scope = tk.StringVar(value=f'All eligible ({len(all_rows)})')
+        options=[f'All eligible ({len(all_rows)})',f'Filtered ({len(filtered_rows)})']
+        ctk.CTkLabel(body,text='Include',anchor='w').grid(row=2,column=0,sticky='w')
+        ctk.CTkOptionMenu(body,values=options,variable=scope,height=36,width=280).grid(row=2,column=1,padx=(16,0),sticky='ew')
+        missing = sum(bool(attention_reasons(r)) for r in all_rows)
+        description = (f'Includes {missing} records needing review. Missing values stay blank.' if self._pref('export_missing')
+                       else 'Complete candidates with uploaded resumes only.')
+        ctk.CTkLabel(body,text=description,text_color=WARNING_TEXT if self._pref('export_missing') else MUTED_TEXT,
+            anchor='w',wraplength=480,justify='left').grid(row=3,column=0,columnspan=2,sticky='w',pady=(8,12))
+        ctk.CTkLabel(body,text='Job ID'+(' (optional)' if regular else ''),anchor='w').grid(row=4,column=0,sticky='w')
+        entry_job_id=ctk.CTkEntry(body,placeholder_text='e.g. JOB_101',width=280,height=36)
+        entry_job_id.grid(row=4,column=1,padx=(16,0),sticky='ew')
+        recent = list(reversed(self._review_store.history))[:8]
+        if recent:
+            pick=tk.StringVar(value='Choose recent Job ID')
+            def use_recent(value):
+                if value=='Choose recent Job ID': return
+                entry_job_id.delete(0,tk.END);entry_job_id.insert(0,value)
+            ctk.CTkOptionMenu(body,values=['Choose recent Job ID']+recent,variable=pick,
+                command=use_recent,height=36,width=280).grid(row=5,column=1,padx=(16,0),sticky='ew',pady=(8,0))
+        error=ctk.CTkLabel(body,text='',text_color=DANGER_TEXT,anchor='w',wraplength=450)
+        error.grid(row=6,column=0,columnspan=2,sticky='w')
+        more=ctk.CTkFrame(body,fg_color='transparent')
+        more.grid_columnconfigure(1,weight=1)
+        fields={}
+        for i,(key,label,hint) in enumerate([('rate','Expected rate','e.g. $50/hr'),('weeks','Availability (weeks)','e.g. 2'),('notes','Notes','Optional')]):
+            ctk.CTkLabel(more,text=label,anchor='w').grid(row=i,column=0,sticky='w',pady=4)
+            fields[key]=ctk.CTkEntry(more,placeholder_text=hint,height=36)
+            fields[key].grid(row=i,column=1,sticky='ew',padx=(16,0),pady=4)
+        ctk.CTkLabel(more,text='Full time',anchor='w').grid(row=3,column=0,sticky='w',pady=4)
+        fulltime=ctk.CTkSegmentedButton(more,values=['Yes','No'],height=36)
+        fulltime.set('Yes');fulltime.grid(row=3,column=1,sticky='w',padx=(16,0),pady=4)
         def toggle_more():
-            if frame_more.winfo_manager():
-                frame_more.grid_remove()
-                btn_more.configure(text="More options ▸")
+            if more.winfo_manager():
+                more.grid_remove();btn_more.configure(text='More options ▸')
             else:
-                frame_more.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(4, 0))
-                btn_more.configure(text="Fewer options ▾")
-
-        btn_more.configure(command=toggle_more)
-        btn_more.grid(row=4, column=0, columnspan=2, sticky="w")
-
+                more.grid(row=8,column=0,columnspan=2,sticky='ew',pady=8);btn_more.configure(text='Fewer options ▾')
+        btn_more=secondary_button(body,text='More options ▸',width=150,command=toggle_more)
+        if not regular: btn_more.grid(row=7,column=0,columnspan=2,sticky='w')
         def submit(event=None):
-            if not entry_job_id.get().strip():
-                lbl_error.configure(text="Enter a Job ID to export.")
-                entry_job_id.focus_set()
-                return
-            self.execute_final_export(dialog, deduped_candidates, entry_job_id.get(),
-                                      fields["rate"].get(), fields["weeks"].get(),
-                                      fields["notes"].get(), option_full_time.get())
-
-        buttons = ctk.CTkFrame(body, fg_color="transparent")
-        buttons.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(20, 0))
-        ctk.CTkButton(buttons, text="Export", width=120, height=36, fg_color=ACCENT,
-                      hover_color=ACCENT_HOVER, command=submit).pack(side="right")
-        secondary_button(buttons, text="Cancel", width=100, command=dialog.destroy).pack(side="right", padx=(0, 8))
-        dialog.bind("<Return>", submit)
-        dialog.bind("<Escape>", lambda event: dialog.destroy())
-
+            if generation != self._run_gen:
+                dialog.destroy();return
+            rows = filtered_rows if scope.get()==options[1] else all_rows
+            job = entry_job_id.get().strip()
+            if not rows:
+                error.configure(text='No eligible candidates in the current filter.');return
+            if not regular and not job:
+                error.configure(text='Enter a Job ID to export.');entry_job_id.focus_set();return
+            self.execute_final_export(dialog,rows,job,fields['rate'].get(),fields['weeks'].get(),
+                fields['notes'].get(),fulltime.get(),regular=regular,matched=matched)
+        ctk.CTkLabel(body,text='CSV generation does not submit candidates to an ATS.',anchor='w',text_color=MUTED_TEXT).grid(row=9,column=0,columnspan=2,sticky='w',pady=(14,0))
+        buttons=ctk.CTkFrame(body,fg_color='transparent')
+        buttons.grid(row=10,column=0,columnspan=2,sticky='e',pady=(16,0))
+        secondary_button(buttons,text='Cancel',width=120,command=dialog.destroy).pack(side='left',padx=(0,8))
+        ctk.CTkButton(buttons,text='Generate CSV',width=150,height=36,command=submit).pack(side='left')
+        dialog.bind('<Return>',submit);dialog.bind('<Escape>',lambda e:dialog.destroy())
         dialog.update_idletasks()
-        x = self.winfo_rootx() + max(0, (self.winfo_width() - dialog.winfo_reqwidth()) // 2)
-        y = self.winfo_rooty() + max(0, (self.winfo_height() - dialog.winfo_reqheight()) // 3)
-        dialog.geometry(f"+{x}+{y}")
-        dialog.after(100, entry_job_id.focus_set)
+        dialog.geometry(f'+{self.winfo_rootx()+max(0,(self.winfo_width()-dialog.winfo_reqwidth())//2)}+{self.winfo_rooty()+60}')
+        dialog.grab_set()
+        animate_window_open(dialog,self._pref('reduce_motion'))
+        dialog.after(100,entry_job_id.focus_set)
 
-    def execute_final_export(self, dialog, valid_candidates, job_id, expected_rate, availability_weeks, notes, is_fulltime):
-        job_id = job_id.strip()
-        if not job_id:
-            messagebox.showerror("Error", "Please enter a Job ID before exporting.", parent=dialog)
-            return
-
-        file_path = filedialog.asksaveasfilename(
-            defaultextension=".csv", filetypes=[("CSV Files", "*.csv")],
-            title="Save Final CSV As", initialfile="final_candidate_data.csv"
-        )
-        
-        if not file_path:
-            return
-            
+    def execute_final_export(self, dialog, valid_candidates, job_id, expected_rate, availability_weeks, notes, is_fulltime,
+                             regular=None, matched=None):
+        if regular is None: regular=ExtractorApp._pref(self,'regular_export') is True
+        if matched is None: matched=getattr(self,'_batch_matching_enabled',False) is True
+        job_id=job_id.strip()
+        if not regular and not job_id:
+            messagebox.showerror('Error','Please enter a Job ID before exporting.',parent=dialog);return
+        if job_id and not re.fullmatch(r'[\w .-]+',job_id):
+            messagebox.showerror('Job ID','Use letters, numbers, spaces, underscores, dots or dashes in the Job ID.',parent=dialog);return
+        review=getattr(self,'_review_store',None)
+        hashes=[r.get('FileHash') or r.get('SourceFilename') for r in valid_candidates]
+        if isinstance(review,ReviewStore) and ExtractorApp._pref(self,'warn_previous_exports'):
+            count=review.previous(job_id,hashes)
+            if count and not messagebox.askyesno('Previously generated CSV',
+                f'{count} candidates already had a CSV generated for {job_id}. Generate another CSV including them?',parent=dialog): return
+        kwargs=dict(defaultextension='.csv',filetypes=[('CSV Files','*.csv')],title='Save candidate CSV',initialfile='candidate_data.csv')
+        directory=ExtractorApp._pref(self,'export_directory')
+        if ExtractorApp._pref(self,'remember_export_folder') and directory: kwargs['initialdir']=directory
+        file_path=filedialog.asksaveasfilename(**kwargs)
+        if not file_path: return
         try:
-            directory = os.path.dirname(file_path)
-            
-            # Split valid_candidates into batches of max 99 rows
-            batch_size = 99
-            batches = [valid_candidates[i:i + batch_size] for i in range(0, len(valid_candidates), batch_size)]
-            
-            if not batches:
-                batches = [[]]
-                
-            for idx, batch in enumerate(batches, 1):
-                batch_file_name = f"{job_id}_candidate_data_batch_{idx}.csv"
-                batch_file_path = os.path.join(directory, batch_file_name)
-                
-                with open(batch_file_path, "w", newline="", encoding="utf-8") as f:
-                    writer = csv.writer(f)
-                    writer.writerow([
-                        "name", "email", "phone", "country", "job_id", "expected_rate",
-                        "availability_weeks", "resume_link", "years_of_experience",
-                        "linkedin_url", "notes", "is_fulltime", "match_percentage"
-                    ])
-                    for row in batch:
-                        res_link = row.get("ResumeDriveURL") if row.get("ResumeLink") == "Uploaded" else row.get("ResumeLink", "")
-                        writer.writerow([
-                            row.get("Name"),
-                            row.get("Email"),
-                            row.get("Phone"),
-                            row.get("Country"),
-                            job_id,
-                            expected_rate,
-                            availability_weeks,
-                            res_link,
-                            row.get("YearsOfExperience"),
-                            row.get("linkedin_url", ""),
-                            notes,
-                            is_fulltime,
-                            row.get("MatchPercentage")
-                        ])
-            
-            with_linkedin = sum(1 for row in valid_candidates if row.get("linkedin_url"))
-            without_linkedin = len(valid_candidates) - with_linkedin
-            print(f"[Export Statistics] Candidates with LinkedIn URL: {with_linkedin}")
-            print(f"[Export Statistics] Candidates without LinkedIn URL: {without_linkedin}")
-            
+            directory=os.path.dirname(file_path)
+            batches=[valid_candidates[i:i+99] for i in range(0,len(valid_candidates),99)]
+            if not batches: return
+            prefix=job_id or os.path.splitext(os.path.basename(file_path))[0]
+            paths=[os.path.join(directory,f'{prefix}_candidate_data_batch_{i}.csv') for i in range(1,len(batches)+1)]
+            if any(os.path.exists(path) for path in paths):
+                if not messagebox.askyesno('Replace existing CSV',f'{len(paths)} CSV files will be generated in {directory}. Existing files with these names will be replaced. Continue?',parent=dialog): return
+            for path,batch in zip(paths,batches):
+                temporary=path+'.tmp'
+                try:
+                    with open(temporary,'w',newline='',encoding='utf-8') as f:
+                        writer=csv.writer(f);writer.writerow(csv_fields(regular,matched))
+                        for row in batch:
+                            writer.writerow(csv_values(row,regular,matched,job_id,expected_rate,availability_weeks,notes,is_fulltime))
+                    os.replace(temporary,path)
+                finally:
+                    if os.path.exists(temporary): os.remove(temporary)
+            warnings=[]
+            if isinstance(review,ReviewStore):
+                try: review.record_export(job_id,hashes,time.strftime('%Y-%m-%d %H:%M'))
+                except OSError: warnings.append('CSV history could not be saved.')
+            prefs=getattr(self,'preferences',None)
+            if isinstance(prefs,dict) and prefs['remember_export_folder']:
+                prefs['export_directory']=directory
+                try: self._preference_store.save(prefs)
+                except OSError: warnings.append('Export folder preference could not be saved.')
             dialog.destroy()
-            self._export_succeeded(directory, len(valid_candidates), len(batches))
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to save CSV:\n{e}", parent=dialog)
+            self._export_succeeded(directory,len(valid_candidates),len(batches))
+            if warnings:
+                self.lbl_status.configure(text=self.lbl_status.cget('text')+' '+' '.join(warnings))
+        except Exception as exc:
+            messagebox.showerror('Export failed',f'Could not finish CSV generation:\n{exc}',parent=dialog)
 
     def _export_succeeded(self, directory, rows, files):
         """Report the export in the status line, with a link to the folder instead of a popup."""
         self._last_export_dir = directory
-        self.lbl_status.configure(text=f"Exported {rows} candidate{'s' if rows != 1 else ''} to "
+        self._log_activity(f"Exported {rows} candidate{'s' if rows != 1 else ''} to {directory}")
+        self.lbl_status.configure(text=f"CSV generated for {rows} candidate{'s' if rows != 1 else ''} to "
                                        f"{files} CSV file{'s' if files != 1 else ''} in "
                                        f"{os.path.basename(directory) or directory}.")
         self.btn_reveal.grid()

@@ -190,11 +190,12 @@ class TestExtractor(unittest.TestCase):
         
         corrupt_row = next(r for r in self.app.extracted_data if r["SourceFilename"] == "corrupt.pdf")
         self.assertEqual(corrupt_row["Name"], "Read Error")
-        self.assertEqual(corrupt_row["ResumeLink"], "Failed")
+        self.assertEqual(corrupt_row["ResumeLink"], "Not uploaded")
         
         skip_row = next(r for r in self.app.extracted_data if r["SourceFilename"] == "skip.pdf")
-        self.assertEqual(skip_row["Name"], "Filtered")
-        self.assertEqual(skip_row["ResumeLink"], "Failed")
+        self.assertEqual(skip_row["Name"], "Candidate One")
+        self.assertEqual(skip_row["ResumeLink"], "Not uploaded")
+        self.assertEqual(skip_row["MatchPercentage"], "Not evaluated")
         
         success_row = next(r for r in self.app.extracted_data if r["SourceFilename"] == "resume1.pdf")
         self.assertEqual(success_row["Name"], "Candidate One")
@@ -508,7 +509,7 @@ class TestDriveUploader(unittest.TestCase):
         mock_isfile.return_value = True
         
         mock_get_file_hash.side_effect = lambda filepath: dummy_md5(os.path.basename(filepath))
-        mock_upload_resume.side_effect = lambda service, path, upload_name=None, should_cancel=None: f"http://drive/{os.path.basename(path)}"
+        mock_upload_resume.side_effect = lambda service, path, upload_name=None, should_cancel=None, parent_id=None: f"http://drive/{os.path.basename(path)}"
         
         # 1. Cache empty: should upload all supported
         res = drive_uploader.upload_all_resumes("dummy_folder")
@@ -891,7 +892,7 @@ class TestFinalCSVExport(unittest.TestCase):
                 # Check second row (resume_link should be status if not uploaded)
                 self.assertEqual(reader[2], [
                     "Divya Agnihotri", "divya@example.com", "9876543211", "United States",
-                    "JOB_123", "50", "4", "Pending",
+                    "JOB_123", "50", "4", "",
                     "2", "", "Awesome candidate", "Yes", "70"
                 ])
                 
@@ -1631,6 +1632,35 @@ class TestMatchCacheAndAtomicWrites(unittest.TestCase):
     def _run(self, jd="JD", model="gpt-5"):
         self.app.extraction_thread("dummy_folder", ["resume1.pdf"], [], jd, "api-key", model)
 
+    def test_saved_correction_is_used_before_upload_validation(self):
+        import contextlib
+        from workflow_policy import ReviewStore
+        self.app._review_store=ReviewStore(os.path.join(self.tmp,'review.json'))
+        self.app._review_store.correct(dummy_md5('resume1.pdf'),{'Phone':'1234567890'})
+        with contextlib.ExitStack() as stack:
+            mocks=self._pipeline_mocks(stack)
+            async def incomplete(*args,**kwargs):
+                return dict(Name='Candidate One',Email='one@example.com',Phone='Not Found',Country='US',YearsOfExperience='5')
+            mocks['extract_data_with_ai_async'].side_effect=incomplete
+            self._run(jd='')
+        row=self.app.candidates_by_file['resume1.pdf']
+        self.assertEqual(row['Phone'],'1234567890')
+        self.assertEqual(row['ResumeLink'],'Pending')
+        self.assertEqual(self.app.upload_queue.qsize(),1)
+
+    def test_evaluation_retry_reuses_completed_upload(self):
+        import contextlib
+        self.app._reuse_uploads={'resume1.pdf':(dummy_md5('resume1.pdf'),'https://drive.test/existing')}
+        self.app.add_or_update_candidate(dict(SourceFilename='resume1.pdf',Name='Candidate One',
+            ResumeLink='Uploaded',ResumeDriveURL='https://drive.test/existing'))
+        with contextlib.ExitStack() as stack:
+            self._pipeline_mocks(stack)
+            self._run()
+        self.assertTrue(self.app.upload_queue.empty())
+        row=self.app.candidates_by_file['resume1.pdf']
+        self.assertEqual(row['ResumeLink'],'Uploaded')
+        self.assertEqual(row['ResumeDriveURL'],'https://drive.test/existing')
+
     def test_atomic_write_json_preserves_old_on_failure(self):
         import drive_uploader
         path = os.path.join(self.tmp, "x.json")
@@ -2222,19 +2252,19 @@ class TestTableState(unittest.TestCase):
         self._add("c.pdf", 50)
         self.app.filter_table()
         self.app.sort_table("MatchPct", True)
-        self.assertEqual(self._pcts(), ["90", "50", "10"])
+        self.assertEqual(self._pcts(), ["90%", "50%", "10%"])
         self._add("d.pdf", 70)
         self.app.filter_table()
-        self.assertEqual(self._pcts(), ["90", "70", "50", "10"])
+        self.assertEqual(self._pcts(), ["90%", "70%", "50%", "10%"])
 
     def test_sort_toggles_same_column(self):
         self._add("a.pdf", 10)
         self._add("b.pdf", 90)
         self.app.filter_table()
         self.app.sort_table("MatchPct", True)
-        self.assertEqual(self._pcts(), ["90", "10"])
+        self.assertEqual(self._pcts(), ["90%", "10%"])
         self.app.sort_table("MatchPct", True)
-        self.assertEqual(self._pcts(), ["10", "90"])
+        self.assertEqual(self._pcts(), ["10%", "90%"])
         self.app.sort_table("Name", False)
         self.assertEqual(self.app._sort_state, ("Name", False, True))
 
@@ -2260,7 +2290,8 @@ class TestTableState(unittest.TestCase):
         self.tree.selection_set("b.pdf")
         self.app.show_candidate_details = MagicMock()
         self.app.on_row_double_click(None)
-        self.app.show_candidate_details.assert_called_once_with(second)
+        self.assertEqual(self.app.show_candidate_details.call_args.args[0]["SourceFilename"], "b.pdf")
+        self.assertEqual(self.app.show_candidate_details.call_args.args[0]["MergedSources"], ["a.pdf", "b.pdf"])
 
 
 class TestUploadPool(unittest.TestCase):
@@ -2279,7 +2310,7 @@ class TestUploadPool(unittest.TestCase):
             patch.object(drive_uploader, "get_drive_service", MagicMock()),
             patch.object(drive_uploader, "get_drive_credentials", MagicMock()),
             patch.object(drive_uploader, "_upload_single_file",
-                         MagicMock(side_effect=lambda service, path, upload_name=None, should_cancel=None:
+                         MagicMock(side_effect=lambda service, path, upload_name=None, should_cancel=None, parent_id=None:
                                    "http://drive/" + os.path.basename(path))),
             patch.object(extractor, "atomic_write_json", MagicMock()),
         ]
@@ -2372,7 +2403,7 @@ class TestUploadPool(unittest.TestCase):
     def test_should_cancel_follows_cancelled_gen(self):
         seen = []
 
-        def capture(service, path, upload_name=None, should_cancel=None):
+        def capture(service, path, upload_name=None, should_cancel=None, parent_id=None):
             seen.append(should_cancel)
             return "http://drive/" + os.path.basename(path)
         self.du._upload_single_file.side_effect = capture
@@ -2399,7 +2430,7 @@ class TestUploadPool(unittest.TestCase):
     def test_upload_workers_run_concurrently(self):
         import time
 
-        def slow(service, path, upload_name=None, should_cancel=None):
+        def slow(service, path, upload_name=None, should_cancel=None, parent_id=None):
             time.sleep(0.2)
             return "http://drive/" + os.path.basename(path)
         self.du._upload_single_file.side_effect = slow
@@ -2414,7 +2445,7 @@ class TestUploadPool(unittest.TestCase):
     def test_each_worker_has_own_service(self):
         import time
 
-        def slow(service, path, upload_name=None, should_cancel=None):
+        def slow(service, path, upload_name=None, should_cancel=None, parent_id=None):
             time.sleep(0.1)
             return "http://drive/" + os.path.basename(path)
         self.du._upload_single_file.side_effect = slow
@@ -2638,7 +2669,7 @@ class TestUploadPool(unittest.TestCase):
         import time
         started = threading.Event()
 
-        def slow(service, path, upload_name=None, should_cancel=None):
+        def slow(service, path, upload_name=None, should_cancel=None, parent_id=None):
             started.set()
             time.sleep(0.2)
             return "http://drive/shared"
@@ -2663,7 +2694,7 @@ class TestUploadPool(unittest.TestCase):
         started = threading.Event()
         calls = []
 
-        def first_fails(service, path, upload_name=None, should_cancel=None):
+        def first_fails(service, path, upload_name=None, should_cancel=None, parent_id=None):
             calls.append(path)
             if len(calls) == 1:
                 started.set()
@@ -2900,19 +2931,14 @@ class TestDriveUploadChunksAndFallback(unittest.TestCase):
         self.assertEqual(request.next_chunk.call_count, 1)
         service.permissions.assert_not_called()
 
-    def test_parent_permission_fallback_is_remembered(self):
-        parents = []
-
-        def fake_internal(service, path, upload_name, parent_id, should_cancel=None):
+    def test_parent_permission_failure_never_redirects(self):
+        parents=[]
+        def fake_internal(service,path,upload_name,parent_id,should_cancel=None):
             parents.append(parent_id)
-            if parent_id != "root":
-                raise RuntimeError("insufficientParentPermissions")
-            return "http://drive/x"
-        with patch.object(self.du, "_upload_single_file_internal", side_effect=fake_internal), \
-             patch("builtins.print"), patch("traceback.print_exc"):
-            self.du._upload_single_file(MagicMock(), self.path)
-            self.du._upload_single_file(MagicMock(), self.path)
-        self.assertEqual(parents, [self.du.DRIVE_FOLDER_ID, "root", "root"])
+            raise RuntimeError('insufficientParentPermissions')
+        with patch.object(self.du,'_upload_single_file_internal',side_effect=fake_internal), patch('builtins.print'), patch('traceback.print_exc'):
+            with self.assertRaises(RuntimeError): self.du._upload_single_file(MagicMock(),self.path)
+        self.assertEqual(parents,[self.du.DRIVE_FOLDER_ID])
 
     def test_drive_service_has_request_timeout(self):
         with patch.object(self.du, "build") as build:
@@ -2959,7 +2985,7 @@ class TestStability(unittest.TestCase):
         finished.assert_called_once()
         pe.assert_called()
         a, b = self._row("a.pdf"), self._row("b.pdf")
-        self.assertEqual(a["MatchPercentage"], 0)
+        self.assertEqual(a["MatchPercentage"], "Not evaluated")
         self.assertTrue(a["Summary"].startswith("Evaluation Failed"))
         self.assertIn("boom", a["Summary"])
         self.assertEqual(b["MatchPercentage"], 85)
@@ -3217,7 +3243,10 @@ class TestStability(unittest.TestCase):
         app.after = MagicMock()
         for name in ("_post", "_drain_ui_events", "on_close"):
             setattr(app, name, getattr(extractor.ExtractorApp, name).__get__(app, extractor.ExtractorApp))
-        app.on_close()
+        app._run_gen = 1
+        app._smooth_scroll = MagicMock()
+        app.preferences = {}
+        app.on_close(force=True)
         app._save_drive_cache.assert_called_once_with(force=True)
         app.destroy.assert_called_once()
         self.assertTrue(app._closing)
@@ -3228,7 +3257,10 @@ class TestStability(unittest.TestCase):
         app = MagicMock(spec=extractor.ExtractorApp)
         app._save_drive_cache.side_effect = OSError("disk full")
         app.on_close = extractor.ExtractorApp.on_close.__get__(app, extractor.ExtractorApp)
-        app.on_close()
+        app._run_gen = 1
+        app._smooth_scroll = MagicMock()
+        app.preferences = {}
+        app.on_close(force=True)
         app.destroy.assert_called_once()
 
     def test_match_timeout_60(self):

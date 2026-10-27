@@ -209,6 +209,8 @@ class TestWindowLoading(unittest.TestCase):
             with open(os.path.join(folder, 'resume.txt'), 'w') as f:
                 f.write('Alice Smith\nalice@example.com\n+1 212 555 1234\nNew York, USA')
             stack.enter_context(patch.object(extractor, 'RESUME_CACHE_FILE', os.path.join(folder, 'cache.json')))
+            stack.enter_context(patch.object(extractor, 'PREFERENCES_FILE', os.path.join(folder,'prefs.json')))
+            stack.enter_context(patch.object(extractor, 'REVIEW_FILE', os.path.join(folder,'review.json')))
             stack.enter_context(patch.object(extractor.ExtractorApp, 'start_upload_worker',
                                              lambda app: setattr(app, 'upload_queue', queue.Queue())))
             stack.enter_context(patch.object(extractor.ExtractorApp, '_save_drive_cache'))
@@ -250,7 +252,7 @@ class TestWindowLoading(unittest.TestCase):
             finally:
                 # Let scheduled CTk drawing callbacks finish before destroying Tk.
                 app.update_idletasks()
-                app.on_close()
+                app.on_close(force=True)
 
 
 if __name__ == '__main__':

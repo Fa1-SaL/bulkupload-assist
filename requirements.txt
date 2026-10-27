@@ -7,3 +7,5 @@ google-auth
 google-auth-oauthlib
 comtypes
 docx2txt
+
+keyring>=25

@@ -26,9 +26,16 @@ HTTP_TIMEOUT_S = 60         # per-request socket timeout: a stalled connection r
 OAUTH_TIMEOUT_S = 300       # give up on the browser sign-in after this long instead of waiting forever
 UPLOAD_CHUNK_SIZE = 1024 * 1024  # resumable chunk size (multiple of 256 KiB); cancel is checked between chunks
 
-# Set once the target folder rejects an upload for permissions; later uploads go
-# straight to My Drive root instead of failing against the folder first.
+# Retained for compatibility with older callers; uploads never silently redirect.
 _use_root_parent = False
+
+def normalize_folder_id(value):
+    value = str(value or '').strip()
+    match = re.search(r'/folders/([\w-]+)',value)
+    if match: return match.group(1)
+    if value and not re.fullmatch(r'[\w-]+',value):
+        raise ValueError('Enter a Drive folder ID or a folder link.')
+    return value
 
 
 class UploadCancelled(Exception):
@@ -218,13 +225,12 @@ def _upload_single_file_internal(service, file_path: str, upload_name: str = Non
     return f"https://drive.google.com/file/d/{file_id}/view"
 
 
-def _upload_single_file(service, file_path: str, upload_name: str = None, should_cancel=None) -> str:
+def _upload_single_file(service, file_path: str, upload_name: str = None, should_cancel=None, parent_id=None) -> str:
     """Upload a file with transient failure retries (exponential backoff).
 
     Callers must pass a service owned by the calling thread (see get_drive_service).
     should_cancel: optional callable; when it returns True the upload stops with
     UploadCancelled (checked between chunks and before each retry)."""
-    global _use_root_parent
     import ssl
     import socket
 
@@ -234,8 +240,8 @@ def _upload_single_file(service, file_path: str, upload_name: str = None, should
 
     for attempt in range(1, max_retries + 2):
         try:
-            parent_id = 'root' if _use_root_parent else DRIVE_FOLDER_ID
-            return _upload_single_file_internal(service, file_path, upload_name, parent_id, should_cancel)
+            destination = normalize_folder_id(parent_id) if parent_id else DRIVE_FOLDER_ID
+            return _upload_single_file_internal(service, file_path, upload_name, destination, should_cancel)
 
         except UploadCancelled:
             raise
@@ -243,17 +249,8 @@ def _upload_single_file(service, file_path: str, upload_name: str = None, should
         except Exception as e:
             err_msg = str(e).lower()
 
-            # Handle parent folder permissions (immediate fallback, no retry needed for this error category)
-            if "insufficientparentpermissions" in err_msg or "insufficient permissions for the specified parent" in err_msg:
-                print(f"[!] Permissions issue on parent folder for {filename}. Falling back to personal Drive Root...")
-                _use_root_parent = True
-                try:
-                    return _upload_single_file_internal(service, file_path, upload_name, 'root', should_cancel)
-                except UploadCancelled:
-                    raise
-                except Exception as root_err:
-                    log_upload_error(filename, root_err, attempt)
-                    raise root_err
+            if 'insufficientparentpermissions' in err_msg or 'insufficient permissions for the specified parent' in err_msg:
+                raise RuntimeError('Drive folder does not allow uploads. Change the folder or account in Settings, then retry.') from e
 
             # Determine if exception is a retryable transient failure
             is_transient = False

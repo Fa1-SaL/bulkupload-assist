@@ -9,3 +9,7 @@ __pycache__/
 processing_summary.csv
 .superpowers/
 .venv314/
+
+# Local workspace preferences, manual corrections and CSV generation history
+preferences.json
+review_state.json
