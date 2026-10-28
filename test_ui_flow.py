@@ -213,6 +213,7 @@ class TestSimpleWorkflow(unittest.TestCase):
         self.assertEqual(customtkinter.ScalingTracker.widget_scaling,1.0)
 
     def test_horizontal_wheel_over_table_works_with_window_focus(self):
+        self.app.geometry('1200x700')  # Guarantee overflow on wider/high-DPI screens.
         self.app.deiconify()
         self.candidate(link='Uploaded')
         self.app.bv_all_columns.set(True)
@@ -232,6 +233,7 @@ class TestSimpleWorkflow(unittest.TestCase):
         self.assertAlmostEqual(self.app.tree.xview()[0],settled)
 
     def test_wheel_over_horizontal_scrollbar_is_eased_once(self):
+        self.app.geometry('1200x700')
         self.app.deiconify();self.candidate(link='Uploaded')
         self.app.bv_all_columns.set(True);self.app.toggle_table_columns()
         self.app.filter_table();self.app.update()
@@ -400,6 +402,7 @@ class TestSimpleWorkflow(unittest.TestCase):
         return bar.cget('button_color') == extractor.SCROLL_THUMB
 
     def test_scrollbar_thumbs_only_appear_when_content_overflows(self):
+        self.app.geometry('1200x700')
         self.app.deiconify()
         self.candidate(link='Uploaded')
         self.app.filter_table()
