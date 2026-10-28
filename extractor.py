@@ -1099,8 +1099,8 @@ LLM_CONCURRENCY = 32
 UPLOAD_WORKERS = 4            # parallel Drive upload threads, each with its own service
 DRIVE_CACHE_SAVE_EVERY = 10   # persist drive_cache.json after this many new uploads (and on drain)
 INFLIGHT_UPLOAD_WAIT_S = 300  # max wait for an in-flight upload of the same content (hash)
-DRIVE_AUTH_FAILED_MSG = ("Google Drive sign-in failed earlier in this run; "
-                         "skipped upload (use Retry Failed to sign in again)")
+DRIVE_AUTH_FAILED_MSG = ("Upload service access failed earlier in this run; "
+                         "skipped upload (check your access code, then retry)")
 STAGE2_TOP_N = 15             # always deep-evaluate the top N Stage-1 candidates...
 STAGE2_THRESHOLD = 0.35       # ...plus any candidate whose Stage-1 score reaches this
 CACHE_CHECKPOINT_EVERY = 25   # write resume_cache.json every N completed match tasks
@@ -1503,6 +1503,10 @@ class ExtractorApp(ctk.CTk):
         self.preferences = self._preference_store.load()
         self._review_store = ReviewStore(REVIEW_FILE)
         self._secret_store = SecureApiKeyStore()
+        self._upload_access_store = SecureApiKeyStore(
+            service_name="BulkUploadAssist", username="upload_access_code")
+        try: self._upload_access_code = self._upload_access_store.get() or ""
+        except Exception: self._upload_access_code = ""
         ctk.set_widget_scaling(self.preferences['text_scale'])
         super().__init__()
         self.title("Bulk Upload Assistant")
@@ -1924,7 +1928,8 @@ class ExtractorApp(ctk.CTk):
 
     def _make_settings_window(self):
         return SettingsWindow(self, self.preferences, self.sv_api_key.get(), OPENAI_MODELS,
-            self._save_settings, on_test_ai=self._test_ai_connection,
+            self._save_settings, upload_access_code=self._upload_access_code,
+            on_test_ai=self._test_ai_connection,
             on_clear_analysis=self._clear_analysis_cache, on_clear_history=self._clear_export_history)
 
     def toggle_settings(self):
@@ -1933,7 +1938,8 @@ class ExtractorApp(ctk.CTk):
             self._settings_open = False
             return
         self._settings_open = True
-        self._settings_window.show(current=self.preferences, api_key=self.sv_api_key.get())
+        self._settings_window.show(current=self.preferences, api_key=self.sv_api_key.get(),
+                                   upload_access_code=self._upload_access_code)
         self._settings_window.set_busy(self._pipeline_running or self._has_pending_uploads() or self._connection_busy)
 
     def _dismiss_settings_on_outside_click(self, event):
@@ -1955,21 +1961,29 @@ class ExtractorApp(ctk.CTk):
             settings.cancel()
             self._settings_open = False
 
-    def _save_settings(self, prefs, api_key):
+    def _save_settings(self, prefs, api_key, upload_access_code=None):
+        if upload_access_code is None:
+            upload_access_code = self._upload_access_code
+        upload_access_code = upload_access_code.strip()
         busy = self._pipeline_running or self._has_pending_uploads() or self._connection_busy
         if busy and (api_key != self.sv_api_key.get() or prefs['model'] != self.sv_model.get()
-                     or prefs['drive_folder_id'] != self.preferences['drive_folder_id']):
+                     or upload_access_code != self._upload_access_code):
             raise ValueError('Wait for this batch to finish before changing connections.')
-        import drive_uploader
         prefs = dict(prefs)
-        prefs['drive_folder_id'] = drive_uploader.normalize_folder_id(prefs['drive_folder_id'])
         previous_key = None
+        previous_upload_code = None
         changing_key = prefs['remember_api_key'] or self.preferences['remember_api_key']
+        changing_upload_code = upload_access_code != self._upload_access_code
         if changing_key:
             previous_key = self._secret_store.get()
+        if changing_upload_code:
+            previous_upload_code = self._upload_access_store.get()
         try:
             if prefs['remember_api_key']: self._secret_store.set(api_key)
             elif self.preferences['remember_api_key']: self._secret_store.delete()
+            if changing_upload_code:
+                if upload_access_code: self._upload_access_store.set(upload_access_code)
+                else: self._upload_access_store.delete()
             saved = self._preference_store.save(prefs)
         except Exception:
             if changing_key:
@@ -1978,8 +1992,19 @@ class ExtractorApp(ctk.CTk):
                     else: self._secret_store.set(previous_key)
                 except Exception:
                     messagebox.showerror('Settings', 'Settings could not be saved and secure key storage could not be restored. Check Remember API key before closing.')
+            if changing_upload_code:
+                try:
+                    if previous_upload_code is None: self._upload_access_store.delete()
+                    else: self._upload_access_store.set(previous_upload_code)
+                except Exception:
+                    messagebox.showerror('Settings', 'Settings could not be saved and upload access storage could not be restored.')
             raise
         self.preferences = saved
+        self._upload_access_code = upload_access_code
+        if changing_upload_code:
+            with self._drive_creds_lock:
+                self._drive_creds = None
+                self._drive_auth_failed = False
         self.sv_api_key.set(api_key)
         self.sv_model.set(prefs['model'])
         self._settings_open = False
@@ -2025,18 +2050,17 @@ class ExtractorApp(ctk.CTk):
         def reconnect():
             try:
                 import drive_uploader
-                creds=drive_uploader.get_drive_credentials(force_reauth=True)
+                creds=drive_uploader.get_drive_credentials()
                 with self._drive_creds_lock:
                     self._drive_creds=creds
                     self._drive_auth_failed=False
                 service=drive_uploader.get_drive_service(creds=creds)
-                user=service.about().get(fields='user(emailAddress)').execute().get('user',{})
-                message=f"Drive account: {user.get('emailAddress','connected')}. Test folder access before processing."
-                def complete():
-                    self._drive_account = user.get('emailAddress','Connected')
-                self._post(complete)
+                if not drive_uploader.check_upload_access(service):
+                    raise RuntimeError('Upload access code was rejected')
+                self._post(lambda: messagebox.showinfo('Upload service', 'Upload access is ready.'))
             except Exception:
-                self._post(lambda:messagebox.showerror('Drive sign-in','Could not switch Drive account. Try again in Settings.'))
+                self._post(lambda:messagebox.showerror('Upload service',
+                    'Could not connect to the upload service. Check your access code in Settings.'))
             finally:
                 self._post(self._finish_drive_connection)
         threading.Thread(target=reconnect,daemon=True).start()
@@ -2363,7 +2387,7 @@ class ExtractorApp(ctk.CTk):
         self._set_source_controls("disabled" if busy else "normal")
         self.chk_jd_matching.configure(state="disabled" if busy else "normal")
         failed = any(r.get('ResumeLink') in ('Failed','Cancelled') and r.get('Parsed', True) for r in self.extracted_data)
-        label = ('Connecting Drive…' if getattr(self,'_connection_busy',False) is True else 'Processing…' if self._pipeline_running else 'Uploading…' if pending else
+        label = ('Connecting upload service…' if getattr(self,'_connection_busy',False) is True else 'Processing…' if self._pipeline_running else 'Uploading…' if pending else
                  'Retry processing' if self._pipeline_error else 'Retry uploads' if failed else
                  'Done ✓' if self._pipeline_finished else self._start_button_text())
         self.btn_extract.configure(state='disabled' if busy or (self._pipeline_finished and not failed and not self._pipeline_error) else 'normal', text=label)
@@ -2615,7 +2639,7 @@ class ExtractorApp(ctk.CTk):
         """Re-queue failed and cancelled uploads of parsed candidates."""
         if getattr(self,"_connection_busy",False) is True: return
         import drive_uploader
-        self._batch_drive_folder = drive_uploader.normalize_folder_id(ExtractorApp._pref(self,"drive_folder_id")) or drive_uploader.DRIVE_FOLDER_ID
+        self._batch_drive_folder = drive_uploader.DRIVE_FOLDER_ID
         failed_candidates = [row for row in self.extracted_data if row.get("ResumeLink") in ("Failed", "Cancelled") and row.get("Parsed", True)]
         if not failed_candidates:
             messagebox.showinfo("Retry", "No failed or cancelled uploads to retry.")
@@ -2628,9 +2652,9 @@ class ExtractorApp(ctk.CTk):
         self._shown_progress = 0.0  # Retried uploads lower the true progress again.
         folder = getattr(self, "_batch_folder", "")
         if not isinstance(folder,str) or not folder: folder = self.sv_dir.get()
-        # Let the retry attempt Drive sign-in again, with fresh credentials (recovers a
-        # revoked/expired token); workers rebuild their service when the creds change.
-        with self._drive_creds_lock:  # short: sign-in never holds this lock
+        # Re-read the upload access code on retry; workers rebuild their session
+        # when the code changes.
+        with self._drive_creds_lock:  # short: no network request holds this lock
             self._drive_auth_failed = False
             self._drive_creds = None
 
@@ -2698,7 +2722,7 @@ class ExtractorApp(ctk.CTk):
 
     def _process_disabled_reason(self):
         if self._connection_busy:
-            return "Checking the Google Drive connection…"
+            return "Checking the upload service…"
         if self._pipeline_running:
             return "Resumes are being processed."
         if self._has_pending_uploads():
@@ -3120,12 +3144,6 @@ class ExtractorApp(ctk.CTk):
     def start_extraction(self, automatic=False):
         if self._pipeline_running is True or self._closing is True or self._has_pending_uploads() is True or getattr(self,"_connection_busy",False) is True:
             return
-        try:
-            import drive_uploader
-            drive_uploader.normalize_folder_id(ExtractorApp._pref(self,'drive_folder_id'))
-        except ValueError as exc:
-            self.lbl_status.configure(text=str(exc))
-            return
         api_key = self.sv_api_key.get().strip()
         if not api_key:
             self._open_api_key_settings()
@@ -3192,7 +3210,7 @@ class ExtractorApp(ctk.CTk):
         self._reuse_uploads = {}
         self._batch_matching_enabled = bool(jd_text)
         import drive_uploader
-        self._batch_drive_folder = drive_uploader.normalize_folder_id(ExtractorApp._pref(self,'drive_folder_id')) or drive_uploader.DRIVE_FOLDER_ID
+        self._batch_drive_folder = drive_uploader.DRIVE_FOLDER_ID
 
         self.btn_extract.configure(state="disabled", text="Processing…")
         self.btn_export.configure(state="disabled")
@@ -3222,7 +3240,7 @@ class ExtractorApp(ctk.CTk):
         self.uploading_files.clear()
         self._pipeline_running = True
         self.chk_jd_matching.configure(state="disabled")
-        self._drive_auth_failed = False  # a new run may attempt Drive sign-in again
+        self._drive_auth_failed = False  # a new run may check the upload code again
         self.removal_missing_name = 0
         self.removal_missing_contact = 0
         self.removal_country_unresolved = 0
@@ -4127,18 +4145,16 @@ Years of Experience: {cand_data.get('YearsOfExperience')}
             t.start()
 
     def _get_shared_drive_creds(self):
-        """Fetch Drive credentials once for all workers (others wait for the first fetch).
-        On failure nothing is memoised and the auth circuit breaker opens: later jobs
-        fail fast instead of re-running sign-in until retry/start resets it.
-        _drive_creds_lock is only held for reads/writes of _drive_creds (never across
-        the sign-in), so the main thread can reset it without waiting on the network."""
+        """Read the upload access code once per run; workers share the code but
+        have separate HTTP sessions. A missing code opens the auth circuit breaker
+        until retry/start resets it. The short lock never covers network work."""
         import drive_uploader
         with self._drive_creds_lock:
             if self._drive_creds is not None:
                 return self._drive_creds
         with self._drive_signin_lock:
             with self._drive_creds_lock:
-                if self._drive_creds is not None:  # another worker signed in meanwhile
+                if self._drive_creds is not None:  # another worker read the code
                     return self._drive_creds
                 if self._drive_auth_failed:
                     raise RuntimeError(DRIVE_AUTH_FAILED_MSG)
@@ -4202,7 +4218,7 @@ Years of Experience: {cand_data.get('YearsOfExperience')}
         claim.set()
 
     def upload_worker_loop(self):
-        """One of UPLOAD_WORKERS threads. Owns its Drive service (httplib2 is not
+        """One of UPLOAD_WORKERS threads. Owns its upload service session (HTTP is not
         thread-safe); talks to the UI only via _post. A None job stops the thread.
         Jobs are (run_gen, filename, filepath, file_hash); jobs queued by an earlier
         run are dropped, and every UI event carries the job's run_gen."""
@@ -4232,9 +4248,7 @@ Years of Experience: {cand_data.get('YearsOfExperience')}
                 try:
                     if file_hash is None:
                         file_hash = drive_uploader.get_file_hash(filepath)
-                    destination = getattr(self, '_batch_drive_folder', '')
-                    if isinstance(destination,str) and destination:
-                        file_hash = destination + ':' + file_hash
+                    file_hash = drive_uploader.hosted_cache_key(file_hash)
                     link, claim = self._claim_upload(file_hash)
                 except Exception as e:
                     print(f"[-] Error checking cache/hash for {filename}: {e}")
@@ -4249,9 +4263,9 @@ Years of Experience: {cand_data.get('YearsOfExperience')}
                     self._post(lambda f=filename, g=gen: self.handle_upload_cancelled(f, g))
                     continue  # finally still marks the job done
 
-                # Auth circuit breaker: sign-in already failed this run, fail fast
+                # Auth circuit breaker: access-code loading failed this run
                 if self._drive_auth_failed:
-                    print(f"[Upload] Skipped {filename}: Google Drive sign-in failed earlier")
+                    print(f"[Upload] Skipped {filename}: upload access failed earlier")
                     self._post(lambda f=filename, g=gen: self.handle_upload_failure(
                         f, RuntimeError(DRIVE_AUTH_FAILED_MSG), g))
                     continue  # finally still marks the job done

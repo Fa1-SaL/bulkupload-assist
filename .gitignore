@@ -1,5 +1,10 @@
 token.pickle
 oauth_credentials.json
+owner_oauth.json
+upload_codes*.json
+bridge_secret.txt
+owner_upload_code*.txt
+bridge_url.txt
 service_account.json
 *_cache.json
 *.tmp

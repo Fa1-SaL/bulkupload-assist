@@ -24,6 +24,12 @@ class TestSimpleWorkflow(unittest.TestCase):
         self.stack.enter_context(patch.object(extractor, 'PREFERENCES_FILE', os.path.join(self.folder, 'prefs.json')))
         self.stack.enter_context(patch.object(extractor, 'REVIEW_FILE', os.path.join(self.folder, 'review.json')))
         self.messages = self.stack.enter_context(patch.object(extractor, 'messagebox'))
+        class MemorySecret:
+            def __init__(self, **kwargs): self.value = None
+            def get(self): return self.value
+            def set(self, value): self.value = value
+            def delete(self): self.value = None
+        self.stack.enter_context(patch.object(extractor, 'SecureApiKeyStore', MemorySecret))
         def upload_state(app):
             app.upload_queue = queue.Queue()
             app._drive_creds_lock = threading.Lock()
@@ -115,11 +121,22 @@ class TestSimpleWorkflow(unittest.TestCase):
             self.assertEqual('match_percentage' in header,matched)
             self.assertNotIn('job_id',header)
 
-    def test_invalid_destination_settings_do_not_apply(self):
+    def test_legacy_destination_settings_cannot_redirect_uploads(self):
         prefs=dict(self.app.preferences,drive_folder_id='not a folder!?')
-        with self.assertRaises(ValueError): self.app._save_settings(prefs,'test-key')
-        self.assertEqual(self.app.preferences['drive_folder_id'],'')
+        self.app._save_settings(prefs,'test-key')
+        self.assertNotIn('drive_folder_id', self.app.preferences)
         self.assertFalse(self.app._pipeline_running)
+
+    def test_upload_code_uses_secure_store_and_rolls_back_on_failed_save(self):
+        prefs = dict(self.app.preferences)
+        self.app._save_settings(prefs, 'test-key', 'first-code')
+        self.assertEqual(self.app._upload_access_store.get(), 'first-code')
+        self.assertEqual(self.app._upload_access_code, 'first-code')
+        with patch.object(self.app._preference_store, 'save', side_effect=OSError('disk full')):
+            with self.assertRaises(OSError):
+                self.app._save_settings(prefs, 'test-key', 'second-code')
+        self.assertEqual(self.app._upload_access_store.get(), 'first-code')
+        self.assertEqual(self.app._upload_access_code, 'first-code')
 
     def test_failed_preference_save_restores_previous_secure_key(self):
         prefs=dict(self.app.preferences,remember_api_key=True)
@@ -151,7 +168,7 @@ class TestSimpleWorkflow(unittest.TestCase):
         self.app._finish_drive_connection()
         self.assertFalse(self.app._connection_busy)
 
-    def test_retry_adopts_new_saved_drive_destination_and_keeps_batch_source(self):
+    def test_retry_uses_fixed_owner_destination_and_keeps_batch_source(self):
         self.running()
         self.finish_parsing()
         self.app.handle_upload_failure('alice.pdf',RuntimeError('denied'),1)
@@ -161,7 +178,8 @@ class TestSimpleWorkflow(unittest.TestCase):
         self.app._batch_drive_folder='old-folder'
         self.app.preferences['drive_folder_id']='new-folder'
         self.app.retry_failed_uploads()
-        self.assertEqual(self.app._batch_drive_folder,'new-folder')
+        import drive_uploader
+        self.assertEqual(self.app._batch_drive_folder,drive_uploader.DRIVE_FOLDER_ID)
         job=self.app.upload_queue.get_nowait()
         self.assertEqual(job[2],os.path.join(self.folder,'alice.pdf'))
 

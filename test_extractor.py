@@ -108,7 +108,6 @@ class TestExtractor(unittest.TestCase):
             patch.object(extractor, "RESUME_CACHE_FILE", os.path.join(self.tmp, "resume_cache.json")),
             patch.object(extractor, "JD_CACHE_FILE", os.path.join(self.tmp, "jd_cache.json")),
             patch.object(drive_uploader, "DRIVE_CACHE_FILE", os.path.join(self.tmp, "drive_cache.json")),
-            patch.object(drive_uploader, "TOKEN_FILE", os.path.join(self.tmp, "token.pickle")),
             patch.object(drive_uploader, "get_drive_service", MagicMock()),
             patch.object(drive_uploader, "get_drive_credentials", MagicMock()),
         ]
@@ -485,8 +484,6 @@ class TestDriveUploader(unittest.TestCase):
             patch.object(extractor, "RESUME_CACHE_FILE", os.path.join(self.tmp, "resume_cache.json")),
             patch.object(extractor, "JD_CACHE_FILE", os.path.join(self.tmp, "jd_cache.json")),
             patch.object(drive_uploader, "DRIVE_CACHE_FILE", self.cache_file),
-            # Never touch the real OAuth token or open a browser flow in tests
-            patch.object(drive_uploader, "TOKEN_FILE", os.path.join(self.tmp, "token.pickle")),
             patch.object(drive_uploader, "get_drive_service", MagicMock()),
             patch.object(drive_uploader, "get_drive_credentials", MagicMock()),
         ]
@@ -529,8 +526,8 @@ class TestDriveUploader(unittest.TestCase):
         with open(self.cache_file, "r") as f:
             cached_data = json.load(f)
         self.assertEqual(cached_data, {
-            dummy_md5("resume1.pdf"): "http://drive/resume1.pdf",
-            dummy_md5("resume2.pdf"): "http://drive/resume2.pdf"
+            drive_uploader.hosted_cache_key(dummy_md5("resume1.pdf")): "http://drive/resume1.pdf",
+            drive_uploader.hosted_cache_key(dummy_md5("resume2.pdf")): "http://drive/resume2.pdf"
         })
         
         # 2. Cache hit: should upload 0 files
@@ -2297,7 +2294,6 @@ class TestUploadPool(unittest.TestCase):
         self.posted_lock = threading.Lock()
         self._patches = [
             patch.object(drive_uploader, "DRIVE_CACHE_FILE", os.path.join(self.tmp, "drive_cache.json")),
-            patch.object(drive_uploader, "TOKEN_FILE", os.path.join(self.tmp, "token.pickle")),
             patch.object(drive_uploader, "get_drive_service", MagicMock()),
             patch.object(drive_uploader, "get_drive_credentials", MagicMock()),
             patch.object(drive_uploader, "_upload_single_file",
@@ -2493,11 +2489,11 @@ class TestUploadPool(unittest.TestCase):
         self.assertEqual({c.args[0] for c in self.app.handle_upload_failure.call_args_list},
                          {f"r{i}.pdf" for i in range(8)})
         errors = [str(c.args[1]) for c in self.app.handle_upload_failure.call_args_list]
-        self.assertEqual(sum("Google Drive sign-in" in e for e in errors), 7)
+        self.assertEqual(sum("Upload service access" in e for e in errors), 7)
         self.du._upload_single_file.assert_not_called()
         # Cache hits still succeed while the breaker is open
         h = dummy_md5("hit.pdf")
-        self.app._drive_cache[h] = "http://drive/old"
+        self.app._drive_cache[self.du.hosted_cache_key(h)] = "http://drive/old"
         self.app.upload_queue.put((0, "hit.pdf", os.path.join(self.tmp, "hit.pdf"), h))
         self._join()
         self._run_posted()
@@ -2517,7 +2513,7 @@ class TestUploadPool(unittest.TestCase):
         self.du.get_drive_credentials.assert_not_called()
         self.assertEqual(self.app.handle_upload_failure.call_count, 3)
         self.app.handle_upload_starting.assert_not_called()
-        self.assertTrue(all("Google Drive sign-in" in str(c.args[1])
+        self.assertTrue(all("Upload service access" in str(c.args[1])
                             for c in self.app.handle_upload_failure.call_args_list))
         skip_lines = [l for l in out.getvalue().splitlines() if l.startswith("[Upload] Skipped ")]
         self.assertEqual(len(skip_lines), 3, out.getvalue())
@@ -2602,7 +2598,7 @@ class TestUploadPool(unittest.TestCase):
         self.assertEqual(len(self.app._drive_cache), 25)
 
     def test_cache_hits_do_not_write_cache(self):
-        self.app._drive_cache[dummy_md5("hit.pdf")] = "http://drive/old"
+        self.app._drive_cache[self.du.hosted_cache_key(dummy_md5("hit.pdf"))] = "http://drive/old"
         self.app.upload_queue.put((0, "hit.pdf", os.path.join(self.tmp, "hit.pdf"), dummy_md5("hit.pdf")))
         self._join()
         self._wait_for(lambda: extractor.atomic_write_json.call_count > 0, timeout=0.2)
@@ -2634,7 +2630,7 @@ class TestUploadPool(unittest.TestCase):
             self.app.upload_queue.put((0, "n.pdf", os.path.join(self.tmp, "n.pdf"), None))
             self._join()
         gfh.assert_called_once_with(os.path.join(self.tmp, "n.pdf"))
-        self.assertEqual(self.app._drive_cache.get("h1"), "http://drive/n.pdf")
+        self.assertEqual(self.app._drive_cache.get(self.du.hosted_cache_key("h1")), "http://drive/n.pdf")
 
     def test_stale_gen_job_skipped(self):
         self.app._run_gen = 2
@@ -2712,7 +2708,7 @@ class TestUploadPool(unittest.TestCase):
 
     def test_cache_hit_skips_upload(self):
         h = dummy_md5("cached.pdf")
-        self.app._drive_cache[h] = "url"
+        self.app._drive_cache[self.du.hosted_cache_key(h)] = "url"
         self.app.upload_queue.put((0, "cached.pdf", os.path.join(self.tmp, "cached.pdf"), h))
         self._join()
         self._run_posted()
@@ -2889,61 +2885,54 @@ class TestDriveUploadChunksAndFallback(unittest.TestCase):
         self.path = os.path.join(self.tmp, "r.pdf")
         with open(self.path, "wb") as f:
             f.write(b"%PDF-1.4 test")
-        self._root = patch.object(drive_uploader, "_use_root_parent", False)
-        self._root.start()
 
     def tearDown(self):
         import shutil
-        self._root.stop()
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def _service(self, chunks):
-        service = MagicMock()
-        request = service.files.return_value.create.return_value
-        request.next_chunk.side_effect = chunks
-        return service, request
+    def _service(self):
+        response = MagicMock(status_code=200)
+        response.json.return_value = {"status": "ok", "url": "https://drive.google.com/file/d/abc/view"}
+        session = MagicMock()
+        session.post.return_value = response
+        return self.du.OwnerScriptService(
+            "https://script.google.com/macros/s/test/exec", "owner:" + "a" * 64, session), session
 
     def test_chunked_upload_returns_link(self):
-        service, request = self._service([(MagicMock(), None), (None, {"id": "abc"})])
+        service, session = self._service()
         link = self.du._upload_single_file_internal(service, self.path)
         self.assertEqual(link, "https://drive.google.com/file/d/abc/view")
-        self.assertEqual(request.next_chunk.call_count, 2)
-        request.execute.assert_not_called()
+        import base64
+        self.assertEqual(base64.b64decode(session.post.call_args.kwargs["json"]["data"]), b"%PDF-1.4 test")
 
     def test_should_cancel_stops_before_next_chunk(self):
-        service, request = self._service([(MagicMock(), None), (None, {"id": "abc"})])
+        service, session = self._service()
         calls = []
 
         def should_cancel():
             calls.append(1)
             return len(calls) > 1
-        with self.assertRaises(self.du.UploadCancelled):
+        with patch.object(self.du, "UPLOAD_CHUNK_SIZE", 4), \
+             self.assertRaises(self.du.UploadCancelled):
             self.du._upload_single_file(service, self.path, should_cancel=should_cancel)
-        self.assertEqual(request.next_chunk.call_count, 1)
-        service.permissions.assert_not_called()
+        self.assertEqual(len(calls), 2)
+        session.post.assert_not_called()
 
     def test_parent_permission_failure_never_redirects(self):
-        parents=[]
-        def fake_internal(service,path,upload_name,parent_id,should_cancel=None):
-            parents.append(parent_id)
-            raise RuntimeError('insufficientParentPermissions')
-        with patch.object(self.du,'_upload_single_file_internal',side_effect=fake_internal), patch('builtins.print'), patch('traceback.print_exc'):
-            with self.assertRaises(RuntimeError): self.du._upload_single_file(MagicMock(),self.path)
-        self.assertEqual(parents,[self.du.DRIVE_FOLDER_ID])
+        service, session = self._service()
+        with self.assertRaises(ValueError):
+            self.du._upload_single_file(service, self.path, parent_id="different-folder")
+        session.post.assert_not_called()
 
     def test_drive_service_has_request_timeout(self):
-        with patch.object(self.du, "build") as build:
-            self.du.get_drive_service(creds=MagicMock())
-        http = build.call_args.kwargs["http"]
-        self.assertEqual(http.http.timeout, self.du.HTTP_TIMEOUT_S)
+        service, session = self._service()
+        self.du._upload_single_file(service, self.path)
+        self.assertEqual(session.post.call_args.kwargs["timeout"], (10, self.du.HTTP_TIMEOUT_S))
 
-    def test_oauth_sign_in_times_out(self):
-        flow = MagicMock()
-        with patch.object(self.du, "TOKEN_FILE", os.path.join(self.tmp, "token.pickle")), \
-             patch.object(self.du.InstalledAppFlow, "from_client_secrets_file", return_value=flow), \
-             patch.object(self.du.pickle, "dump"):
-            self.du.get_drive_credentials(force_reauth=True)
-        flow.run_local_server.assert_called_once_with(port=0, timeout_seconds=self.du.OAUTH_TIMEOUT_S)
+    def test_unconfigured_service_fails_before_any_google_sign_in(self):
+        with patch.object(self.du, "UPLOAD_SERVICE_URL", ""):
+            with self.assertRaisesRegex(RuntimeError, "not configured"):
+                self.du.get_drive_credentials()
 
 
 class TestStability(unittest.TestCase):
