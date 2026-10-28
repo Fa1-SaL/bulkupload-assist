@@ -24,6 +24,8 @@ Built with Python, CustomTkinter, the OpenAI API, and the Google Drive API.
 
 PDF, DOCX, and TXT reading does not require Microsoft Word. Legacy DOC files require either Microsoft Word automation on Windows or LibreOffice with `soffice` available on your PATH. Image-only PDFs may need OCR before processing; the app does not include an OCR pipeline.
 
+Windows reads PDFs with the pure-Python `pypdf` library and never imports PyMuPDF's native DLLs. This supports PDF text and hyperlink annotations while keeping Smart App Control enabled. macOS and Linux use PyMuPDF when available, with pypdf as a fallback if the native library cannot load or read a document. Password-protected PDFs without an available password remain read failures.
+
 ## Installation
 
 Clone the repository and create a virtual environment:
@@ -52,6 +54,8 @@ Install dependencies:
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
+
+If an older Windows version of the app failed with **“An Application Control policy has blocked this file”** while importing `_mupdf`, update the app files and rerun the dependency installation above. Launch the updated `extractor.py` using that same Python environment. An existing PyMuPDF installation can remain installed; the Windows app does not load it. No Windows security setting needs to be changed for this PDF fallback.
 
 On Windows, install `pywin32` as well if you want to use Microsoft Word automation for legacy DOC files:
 

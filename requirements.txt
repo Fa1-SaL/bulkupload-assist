@@ -1,11 +1,12 @@
-PyMuPDF
+pypdf>=6,<7
+PyMuPDF; sys_platform != "win32"
 customtkinter
 pydantic
 openai
 google-api-python-client
 google-auth
 google-auth-oauthlib
-comtypes
+comtypes; sys_platform == "win32"
 docx2txt
 
 keyring>=25

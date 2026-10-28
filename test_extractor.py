@@ -1387,22 +1387,17 @@ class TestPhase1Improvements(unittest.TestCase):
         self.assertIn("LinkedIn URLs not found:                         1", log_text)
 
     @patch("extractor.os.path.exists")
-    @patch("extractor.fitz.open")
-    def test_pdf_hyperlink_extraction_and_normalization(self, mock_fitz_open, mock_exists):
+    @patch("extractor.pdf_reader.extract_hyperlinks")
+    def test_pdf_hyperlink_extraction_and_normalization(self, mock_pdf_links, mock_exists):
         from extractor import extract_pdf_hyperlinks, normalize_and_validate_candidate, ExtractorApp
         
         mock_exists.return_value = True
         
-        # 1. Test extract_pdf_hyperlinks using mock fitz doc
-        mock_page = MagicMock()
-        mock_page.get_links.return_value = [
-            {"kind": 2, "uri": "https://www.linkedin.com/in/pdf-user-in"},
-            {"kind": 2, "uri": "https://www.linkedin.com/company/ignored-co"},
-            {"kind": 1, "uri": "http://other-kind-ignored"}
-        ]
-        mock_doc = MagicMock()
-        mock_doc.__iter__.return_value = [mock_page]
-        mock_fitz_open.return_value = mock_doc
+        # Backend-neutral candidate normalization; real PDF parsing is covered
+        # by test_pdf_compat with both native and blocked-native installations.
+        mock_pdf_links.return_value = [
+            "https://www.linkedin.com/in/pdf-user-in",
+            "https://www.linkedin.com/company/ignored-co"]
         
         links = extract_pdf_hyperlinks("dummy.pdf")
         self.assertIn("https://www.linkedin.com/in/pdf-user-in", links)
@@ -1418,27 +1413,23 @@ class TestPhase1Improvements(unittest.TestCase):
         self.assertEqual(res.get("linkedin_source"), "PDF Hyperlink")
         
         # Test ignore non-candidate profiles from PDF (like /company/)
-        mock_page.get_links.return_value = [
-            {"kind": 2, "uri": "https://www.linkedin.com/company/ignored-company"},
-            {"kind": 2, "uri": "https://www.linkedin.com/jobs/view/123"}
-        ]
+        mock_pdf_links.return_value = [
+            "https://www.linkedin.com/company/ignored-company",
+            "https://www.linkedin.com/jobs/view/123"]
         res, _ = normalize_and_validate_candidate(cand, "Plain resume text", "dummy.pdf")
         self.assertEqual(res.get("linkedin_url"), "")
         self.assertEqual(res.get("linkedin_source"), "Not Found")
 
         # Test priority ranking: /in/ (PDF) vs /pub/ (PDF) -> Prefer /in/
-        mock_page.get_links.return_value = [
-            {"kind": 2, "uri": "https://www.linkedin.com/pub/pdf-pub-user/1/2/3"},
-            {"kind": 2, "uri": "https://www.linkedin.com/in/pdf-in-user"}
-        ]
+        mock_pdf_links.return_value = [
+            "https://www.linkedin.com/pub/pdf-pub-user/1/2/3",
+            "https://www.linkedin.com/in/pdf-in-user"]
         res, _ = normalize_and_validate_candidate(cand, "Plain resume text", "dummy.pdf")
         self.assertEqual(res.get("linkedin_url"), "https://www.linkedin.com/in/pdf-in-user")
         self.assertEqual(res.get("linkedin_source"), "PDF Hyperlink")
         
         # Test priority source order: Visible Text > PDF Hyperlink
-        mock_page.get_links.return_value = [
-            {"kind": 2, "uri": "https://www.linkedin.com/in/pdf-in-user"}
-        ]
+        mock_pdf_links.return_value = ["https://www.linkedin.com/in/pdf-in-user"]
         res, _ = normalize_and_validate_candidate(cand, "Visible text contains linkedin.com/in/visible-in-user", "dummy.pdf")
         self.assertEqual(res.get("linkedin_url"), "https://www.linkedin.com/in/visible-in-user")
         self.assertEqual(res.get("linkedin_source"), "Visible Text")

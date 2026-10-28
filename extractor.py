@@ -4,7 +4,7 @@ import traceback
 try:
     import os
     import re
-    import fitz  # PyMuPDF
+    import pdf_reader
     import customtkinter as ctk
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
@@ -242,25 +242,13 @@ def extract_docx_hyperlinks(docx_path: str) -> list:
     return links
 
 def extract_pdf_hyperlinks(pdf_path: str) -> list:
-    links = []
     if not pdf_path or not os.path.exists(pdf_path):
-        return links
+        return []
     try:
-        doc = fitz.open(pdf_path)
-        for page in doc:
-            try:
-                page_links = page.get_links()
-                for link in page_links:
-                    if link.get("kind") == fitz.LINK_URI:
-                        uri = link.get("uri", "")
-                        if uri:
-                            links.append(uri)
-            except Exception as e:
-                print(f"Error reading links from page in {pdf_path}: {e}")
-        doc.close()
+        return pdf_reader.extract_hyperlinks(pdf_path)
     except Exception as err:
         print(f"Error reading PDF archive {pdf_path}: {err}")
-    return links
+        return []
 
 def normalize_linkedin_url(url: str) -> str:
     if not url:
@@ -534,14 +522,7 @@ def strip_country_code(phone: str) -> str:
 
 def extract_text_from_pdf(filepath):
     try:
-        doc = fitz.open(filepath)
-        text = ""
-        for page in doc:
-            page_text = page.get_text("text")
-            if page_text:
-                text += page_text + "\n"
-        doc.close()
-        return text
+        return pdf_reader.extract_text(filepath)
     except Exception:
         return None
 
@@ -555,7 +536,7 @@ def _word_open_document(word, path):
 
 
 def convert_docx_to_pdf(docx_path: str) -> Optional[str]:
-    """Convert a .docx file to PDF using fitz/PyMuPDF story or Word COM (Windows).
+    """Convert a .docx file to PDF using Word COM or LibreOffice.
     Returns the path to the generated PDF, or None on failure."""
     pdf_path = docx_path[:-5] + "_converted.pdf"
     try:
