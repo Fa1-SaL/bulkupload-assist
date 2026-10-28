@@ -1,13 +1,4 @@
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from google.auth.transport.requests import Request
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
-from googleapiclient.errors import HttpError
-import google_auth_httplib2
-import httplib2
 import os
-import pickle
 import json
 import concurrent.futures
 import time
@@ -15,19 +6,18 @@ import random
 import re
 import traceback
 import threading
-from typing import Optional
+from dataclasses import dataclass
+from urllib.parse import quote
 
-SCOPES = ['https://www.googleapis.com/auth/drive.file']
-DRIVE_FOLDER_ID = '1EhV9pbEZjZg2_D7Tg2Z-zlsFK8DY06Ne'  # personal Drive folder ID
-TOKEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'token.pickle')
-CREDENTIALS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'oauth_credentials.json')
+import requests
+
+DRIVE_FOLDER_ID = '1EhV9pbEZjZg2_D7Tg2Z-zlsFK8DY06Ne'  # fixed owner folder
+# Set to the verified Cloud Run URL after deployment. All distributed clients
+# use this one endpoint; there is no per-user destination override.
+UPLOAD_SERVICE_URL = ''
 DRIVE_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "drive_cache.json")
-HTTP_TIMEOUT_S = 60         # per-request socket timeout: a stalled connection raises (and is retried) instead of hanging
-OAUTH_TIMEOUT_S = 300       # give up on the browser sign-in after this long instead of waiting forever
-UPLOAD_CHUNK_SIZE = 1024 * 1024  # resumable chunk size (multiple of 256 KiB); cancel is checked between chunks
-
-# Retained for compatibility with older callers; uploads never silently redirect.
-_use_root_parent = False
+HTTP_TIMEOUT_S = 300        # the hosted service must receive and upload the file before responding
+UPLOAD_CHUNK_SIZE = 1024 * 1024
 
 def normalize_folder_id(value):
     value = str(value or '').strip()
@@ -41,48 +31,34 @@ def normalize_folder_id(value):
 class UploadCancelled(Exception):
     """Raised when an upload is stopped by its should_cancel callback."""
 
-def get_drive_credentials(force_reauth: bool = False) -> Credentials:
-    """Load the saved OAuth token, refreshing it or running the browser flow as needed."""
-    creds = None
+def hosted_cache_key(file_hash: str) -> str:
+    """Old directly uploaded, user-owned Drive links cannot count as service uploads."""
+    return f'owner-service-v1:{DRIVE_FOLDER_ID}:{file_hash}'
 
-    # Load saved token if exists and we are not forcing re-authentication
-    if not force_reauth and os.path.exists(TOKEN_FILE):
-        try:
-            with open(TOKEN_FILE, 'rb') as f:
-                creds = pickle.load(f)
-        except Exception:
-            pass
 
-    # If no valid token or forcing re-auth, do the OAuth login
-    if force_reauth or not creds or not creds.valid:
-        if not force_reauth and creds and creds.expired and creds.refresh_token:
-            try:
-                creds.refresh(Request())
-            except Exception as e:
-                print(f"Token refresh failed: {e}. Re-authenticating...")
-                return get_drive_credentials(force_reauth=True)
-        else:
-            if os.path.exists(TOKEN_FILE):
-                try:
-                    os.remove(TOKEN_FILE)
-                except Exception:
-                    pass
-            flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, SCOPES)
-            creds = flow.run_local_server(port=0, timeout_seconds=OAUTH_TIMEOUT_S)
-        
-        with open(TOKEN_FILE, 'wb') as f:
-            pickle.dump(creds, f)
+def get_drive_credentials(force_reauth: bool = False) -> str:
+    """Read this user's upload access code from native keyring; never use Google OAuth."""
+    if not UPLOAD_SERVICE_URL:
+        raise RuntimeError('Upload service is not configured. Contact the app owner.')
+    from app_preferences import SecureApiKeyStore
+    code = SecureApiKeyStore(service_name='BulkUploadAssist', username='upload_access_code').get()
+    if not code:
+        raise RuntimeError('Add your upload access code in Settings before processing resumes.')
+    return code
 
-    return creds
+
+@dataclass
+class HostedDriveService:
+    url: str
+    access_code: str
+    session: requests.Session
 
 
 def get_drive_service(force_reauth: bool = False, creds=None):
-    """Build a Drive client. The underlying httplib2 transport is not thread-safe:
-    build one service per thread, sharing a single Credentials object via `creds`.
-    Requests time out after HTTP_TIMEOUT_S so a stalled connection cannot hang a worker."""
-    http = google_auth_httplib2.AuthorizedHttp(
-        creds or get_drive_credentials(force_reauth), http=httplib2.Http(timeout=HTTP_TIMEOUT_S))
-    return build('drive', 'v3', http=http, cache_discovery=False)
+    """Build a separate HTTP session per worker, sharing only the access-code string."""
+    if not UPLOAD_SERVICE_URL.startswith('https://'):
+        raise RuntimeError('Upload service must use HTTPS and be configured by the app owner.')
+    return HostedDriveService(UPLOAD_SERVICE_URL, creds or get_drive_credentials(force_reauth), requests.Session())
 
 
 def get_file_hash(filepath: str) -> str:
@@ -148,81 +124,60 @@ def atomic_write_json(path: str, data) -> None:
 
 
 def migrate_and_validate_cache(cache: dict, folder_path: str) -> dict:
-    """Migrate legacy filename-keyed cache entries to hash-keyed entries and remove invalid schemas."""
+    """Keep only owner-service links; old per-user uploads must be sent again."""
     if not isinstance(cache, dict):
         print("[-] Corrupted cache structure detected. Initializing empty cache.")
         return {}
 
     validated_cache = {}
-    is_md5 = re.compile(r'^[a-fA-F0-9]{32}$')
+    valid_key = re.compile(r'^owner-service-v1:' + re.escape(DRIVE_FOLDER_ID) + r':[a-fA-F0-9]{32}$')
 
     for key, value in cache.items():
         if not isinstance(value, str) or not value.startswith("http"):
             continue  # Discard invalid values
 
-        if is_md5.match(key):
-            # Already in correct hash -> link format
+        if valid_key.fullmatch(key):
             validated_cache[key] = value
-        else:
-            # Legacy format: filename -> link
-            full_path = os.path.join(folder_path, key)
-            if os.path.exists(full_path) and os.path.isfile(full_path):
-                try:
-                    file_hash = get_file_hash(full_path)
-                    validated_cache[file_hash] = value
-                    print(f"[Cache Migration] Migrated cache entry for '{key}' to hash '{file_hash}'")
-                except Exception as e:
-                    print(f"[-] Failed to migrate cache entry for '{key}': {e}")
-            else:
-                print(f"[Cache Migration] Discarded legacy cache entry for '{key}' (file not found on disk)")
 
     return validated_cache
 
 
 def _upload_single_file_internal(service, file_path: str, upload_name: str = None, parent_id: str = DRIVE_FOLDER_ID,
                                  should_cancel=None) -> str:
-    """Helper that performs the actual API upload directly to Google Drive.
-    The file is sent in UPLOAD_CHUNK_SIZE chunks; should_cancel() is checked before
-    each one and raises UploadCancelled (nothing is created on Drive until the last chunk)."""
+    """Stream a resume to the owner service, checking cancellation between chunks."""
     filename = upload_name or os.path.basename(file_path)
-    
-    # Determine MIME type based on extension
-    if filename.lower().endswith('.docx'):
-        mime = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
-    elif filename.lower().endswith('.pdf'):
-        mime = 'application/pdf'
-    else:
-        mime = 'application/octet-stream'
+    if parent_id != DRIVE_FOLDER_ID:
+        raise ValueError('The upload destination is fixed by the app owner.')
 
-    file_metadata = {'name': filename, 'parents': [parent_id]}
-    media = MediaFileUpload(file_path, mimetype=mime, chunksize=UPLOAD_CHUNK_SIZE, resumable=True)
+    def chunks():
+        with open(file_path, 'rb') as source:
+            while True:
+                if should_cancel is not None and should_cancel():
+                    raise UploadCancelled(filename)
+                chunk = source.read(UPLOAD_CHUNK_SIZE)
+                if not chunk:
+                    break
+                yield chunk
 
-    request = service.files().create(
-        body=file_metadata,
-        media_body=media,
-        fields='id'
-    )
-    uploaded = None
-    while uploaded is None:
-        if should_cancel is not None and should_cancel():
-            raise UploadCancelled(filename)
-        _status, uploaded = request.next_chunk()
-
-    if isinstance(uploaded, dict):
-        file_id = uploaded.get('id')
-    else:
-        file_id = str(uploaded)
-
-    if not file_id:
-        raise ValueError(f"Drive API did not return a valid file ID for {filename}")
-
-    # Set reader permissions for link sharing
-    service.permissions().create(
-        fileId=file_id,
-        body={'type': 'anyone', 'role': 'reader'}
-    ).execute()
-
-    return f"https://drive.google.com/file/d/{file_id}/view"
+    response = service.session.post(
+        service.url + '/v1/uploads', data=chunks(),
+        headers={'Authorization': 'Bearer ' + service.access_code,
+                 'X-Upload-Filename': quote(filename, safe=''),
+                 'Content-Type': 'application/octet-stream'},
+        timeout=(10, HTTP_TIMEOUT_S))
+    if response.status_code == 401:
+        raise RuntimeError('Upload access code was rejected. Enter a valid code in Settings.')
+    if response.status_code == 413:
+        raise ValueError('Resume exceeds the upload service size limit (24 MiB).')
+    if response.status_code != 200:
+        raise requests.HTTPError(f'Upload service returned HTTP {response.status_code}', response=response)
+    try:
+        link = response.json()['url']
+    except (ValueError, KeyError, TypeError) as exc:
+        raise RuntimeError('Upload service returned an invalid response.') from exc
+    if not isinstance(link, str) or not link.startswith('https://drive.google.com/file/d/'):
+        raise RuntimeError('Upload service returned an invalid Drive link.')
+    return link
 
 
 def _upload_single_file(service, file_path: str, upload_name: str = None, should_cancel=None, parent_id=None) -> str:
@@ -237,20 +192,18 @@ def _upload_single_file(service, file_path: str, upload_name: str = None, should
     filename = upload_name or os.path.basename(file_path)
     max_retries = 3
     delay = 1.0
+    if parent_id and normalize_folder_id(parent_id) != DRIVE_FOLDER_ID:
+        raise ValueError('The upload destination is fixed by the app owner.')
 
     for attempt in range(1, max_retries + 2):
         try:
-            destination = normalize_folder_id(parent_id) if parent_id else DRIVE_FOLDER_ID
-            return _upload_single_file_internal(service, file_path, upload_name, destination, should_cancel)
+            return _upload_single_file_internal(service, file_path, upload_name, DRIVE_FOLDER_ID, should_cancel)
 
         except UploadCancelled:
             raise
 
         except Exception as e:
             err_msg = str(e).lower()
-
-            if 'insufficientparentpermissions' in err_msg or 'insufficient permissions for the specified parent' in err_msg:
-                raise RuntimeError('Drive folder does not allow uploads. Change the folder or account in Settings, then retry.') from e
 
             # Determine if exception is a retryable transient failure
             is_transient = False
@@ -263,9 +216,9 @@ def _upload_single_file(service, file_path: str, upload_name: str = None, should
             # 3. Connection Resets / Abrupt closures
             elif any(term in err_msg for term in ("connection reset", "connection closed", "remote end closed")):
                 is_transient = True
-            # 4. Google API Transient Codes (429, 5xx)
-            elif isinstance(e, HttpError):
-                status_code = e.resp.status
+            # 4. Hosted service transient responses
+            elif isinstance(e, requests.HTTPError) and e.response is not None:
+                status_code = e.response.status_code
                 if status_code in (429, 500, 502, 503, 504):
                     is_transient = True
 
@@ -341,7 +294,7 @@ def upload_all_resumes(folder_path: str, filenames_to_upload: list = None, max_w
 
         full_path = os.path.join(folder_path, filename)
         try:
-            file_hash = get_file_hash(full_path)
+            file_hash = hosted_cache_key(get_file_hash(full_path))
             file_hashes[filename] = file_hash
         except Exception as e:
             print(f"[-] Hashing failure for {filename}: {e}")

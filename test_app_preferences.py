@@ -115,7 +115,7 @@ class SettingsWindowTests(unittest.TestCase):
         self.saves = []
         self.clears = []
         self.window = prefs.SettingsWindow(self.root, prefs.DEFAULT_PREFERENCES,
-            "session-key", ["gpt-6-luna"], lambda draft, key: self.saves.append((draft, key)),
+            "session-key", ["gpt-6-luna"], lambda draft, key, code: self.saves.append((draft, key, code)),
             on_clear_analysis=lambda: self.clears.append("analysis"))
         self.root.update()
 
@@ -131,6 +131,7 @@ class SettingsWindowTests(unittest.TestCase):
             self.assertNotIn(removed,general)
         self.assertNotIn('Drive',connections)
         self.assertNotIn('drive_folder_id',self.window.variables)
+        self.assertIn('Upload access code',connections)
 
     def test_settings_window_wheel_scrolls_active_page_when_window_has_focus(self):
         self.window.show();self.window.geometry('640x480')
@@ -180,7 +181,7 @@ class SettingsWindowTests(unittest.TestCase):
         self.window._queue_clear("analysis")
         self.window.save()
         self.assertTrue(self.saves[0][0]["recursive"])
-        self.assertEqual("ABC_123", self.saves[0][0]["drive_folder_id"])
+        self.assertNotIn("drive_folder_id", self.saves[0][0])
         self.assertEqual("session-key", self.saves[0][1])
         self.assertEqual(["analysis"], self.clears)
         self.window.cancel()
@@ -209,6 +210,18 @@ class SettingsWindowTests(unittest.TestCase):
         self.assertFalse(self.window.get_draft()["recursive"])
         self.assertEqual("updated-model", self.window.model_menu.get())
         self.assertEqual("new-key", self.window.api_entry.get())
+
+    def test_upload_code_draft_cancels_and_saves_securely(self):
+        self.window.show(upload_access_code="old-code")
+        self.window.upload_code_entry.delete(0, "end")
+        self.window.upload_code_entry.insert(0, "new-code")
+        self.window.cancel()
+        self.assertEqual(self.window.upload_code_entry.get(), "old-code")
+        self.window.show()
+        self.window.upload_code_entry.delete(0, "end")
+        self.window.upload_code_entry.insert(0, "new-code")
+        self.window.save()
+        self.assertEqual(self.saves[-1][2], "new-code")
 
     def test_descriptions_wrap_at_fixed_size_and_minimum_window_size(self):
         prefs.ctk.set_widget_scaling(1.0)

@@ -28,7 +28,6 @@ DEFAULT_PREFERENCES = {
     "sort_state": None,
     "remember_api_key": False,
     "model": "gpt-6-luna",
-    "drive_folder_id": "",
     "recursive": False,
     "jd_matching_default": True,
     "remember_export_folder": True,
@@ -152,7 +151,7 @@ class SettingsWindow(ctk.CTkToplevel):
     """One scrolling page of four sections; a transactional editor whose
     callbacks supply all service actions.
 
-    on_save(preferences, api_key) runs only when Save is pressed. Test callbacks
+    on_save(preferences, api_key, upload_access_code) runs only when Save is pressed. Test callbacks
     accept (api_key, model), and may return a status string.
     Clear callbacks run after a successful Save if requested in this draft.
     """
@@ -163,7 +162,7 @@ class SettingsWindow(ctk.CTkToplevel):
     SECONDARY = "#343A43"
     ACCENT = "#1F6AA5"
 
-    def __init__(self, parent, current, api_key, models, on_save, *,
+    def __init__(self, parent, current, api_key, models, on_save, *, upload_access_code="",
                  on_test_ai=None, on_clear_analysis=None, on_clear_history=None):
         super().__init__(parent, fg_color=self.BG)
         self.withdraw()
@@ -174,6 +173,7 @@ class SettingsWindow(ctk.CTkToplevel):
         self.transient(parent)
         self._original = normalize_preferences(current)
         self._original_key = str(api_key or "")
+        self._original_upload_code = str(upload_access_code or "")
         self._on_save = on_save
         self._on_test_ai = on_test_ai
         self._on_clear_analysis = on_clear_analysis
@@ -183,13 +183,14 @@ class SettingsWindow(ctk.CTkToplevel):
         self._connection_widgets = []
         self.variables = {}
         for key, value in self._original.items():
-            if key in ("text_scale", "smooth_scrolling", "reduce_motion", "drive_folder_id"):
+            if key in ("text_scale", "smooth_scrolling", "reduce_motion"):
                 continue
             if isinstance(value, bool):
                 self.variables[key] = tk.BooleanVar(self, value=value)
             elif isinstance(value, str):
                 self.variables[key] = tk.StringVar(self, value=value)
         self._key_var = tk.StringVar(self, value=self._original_key)
+        self._upload_code_var = tk.StringVar(self, value=self._original_upload_code)
         self._status = tk.StringVar(self, value="Changes apply when you save.")
         self.protocol("WM_DELETE_WINDOW", self.cancel)
         self.bind("<Escape>", lambda event: self.cancel())
@@ -298,6 +299,13 @@ class SettingsWindow(ctk.CTkToplevel):
         test_ai = self._button(page, "Test AI connection", self._test_ai)
         test_ai.pack(anchor="w", padx=12, pady=(0, 15))
         self._connection_widgets.append(test_ai)
+        ctk.CTkLabel(page, text="Upload access code", anchor="w", text_color=self.TEXT).pack(fill="x", padx=12)
+        self.upload_code_entry = ctk.CTkEntry(page, textvariable=self._upload_code_var, show="•",
+            height=36, fg_color=self.PANEL, text_color=self.TEXT)
+        self.upload_code_entry.pack(fill="x", padx=12, pady=(5, 5))
+        self._connection_widgets.append(self.upload_code_entry)
+        self._description(page, "Get your personal code from the app owner. It is stored in your system credential store. "
+            "Resumes are uploaded through the owner's service to one fixed folder.")
     def _build_processing(self, page):
         self._toggle(page, "recursive", "Include subfolders",
             "Find supported resumes inside every subfolder of the selected folder.")
@@ -415,8 +423,9 @@ class SettingsWindow(ctk.CTkToplevel):
     def save(self):
         draft = self.get_draft()
         key = self._key_var.get().strip()
+        upload_code = self._upload_code_var.get().strip()
         try:
-            result = self._on_save(deepcopy(draft), key)
+            result = self._on_save(deepcopy(draft), key, upload_code)
             if result is False:
                 return
         except Exception as exc:
@@ -425,6 +434,7 @@ class SettingsWindow(ctk.CTkToplevel):
             return
         self._original = deepcopy(draft)
         self._original_key = key
+        self._original_upload_code = upload_code
         clear_failures = False
         for kind, callback in (("analysis", self._on_clear_analysis), ("history", self._on_clear_history)):
             if kind in self._pending_clears and callback:
@@ -442,18 +452,22 @@ class SettingsWindow(ctk.CTkToplevel):
         for key, variable in self.variables.items():
             variable.set(self._original[key])
         self._key_var.set(self._original_key)
+        self._upload_code_var.set(self._original_upload_code)
         self._pending_clears.clear()
         self.hide()
 
-    def show(self, current=None, api_key=None):
+    def show(self, current=None, api_key=None, upload_access_code=None):
         """Open a fresh draft, optionally using updated application state."""
         if current is not None:
             self._original = normalize_preferences(current)
         if api_key is not None:
             self._original_key = str(api_key)
+        if upload_access_code is not None:
+            self._original_upload_code = str(upload_access_code)
         for key, variable in self.variables.items():
             variable.set(self._original[key])
         self._key_var.set(self._original_key)
+        self._upload_code_var.set(self._original_upload_code)
         self._pending_clears.clear()
         self._status.set("Changes apply when you save.")
         self._closing = False

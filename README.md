@@ -2,7 +2,7 @@
 
 A desktop app for extracting candidate information from resume folders, optionally matching resumes against a job description, uploading eligible resumes to Google Drive, and exporting candidate records as CSV files.
 
-Built with Python, CustomTkinter, the OpenAI API, and the Google Drive API.
+Built with Python, CustomTkinter, the OpenAI API, and an owner-operated Cloud Run upload service with an Apps Script bridge to Google Drive.
 
 ## Features
 
@@ -19,7 +19,7 @@ Built with Python, CustomTkinter, the OpenAI API, and the Google Drive API.
 
 - Python 3.10 or later with Tkinter available.
 - An OpenAI API key and access to the models selected by the app.
-- A Google account and OAuth desktop-client credentials for Google Drive uploads.
+- An upload access code issued by the app owner. Desktop users do not sign in to Google Drive.
 - An internet connection for AI processing and uploads.
 
 PDF, DOCX, and TXT reading does not require Microsoft Word. Legacy DOC files require either Microsoft Word automation on Windows or LibreOffice with `soffice` available on your PATH. Image-only PDFs may need OCR before processing; the app does not include an OCR pipeline.
@@ -83,15 +83,11 @@ The model menu is defined by `OPENAI_MODELS` in `extractor.py`. Extraction and e
 
 ### Google Drive
 
-1. Create or select a project in Google Cloud and enable the Google Drive API.
-2. Configure the OAuth consent screen. If the app is in testing, add the Google account you will use as a test user.
-3. Create an OAuth client with the **Desktop app** application type.
-4. Download its JSON credentials and save them beside `drive_uploader.py` as `oauth_credentials.json`.
-5. Configure the destination using `DRIVE_FOLDER_ID` in `drive_uploader.py`. Drive uploads and sign-in continue to work normally; Google Drive controls are not exposed in Settings. Existing saved destination configuration is preserved.
+The app owner operates a Cloud Run upload service with an owner-run Apps Script bridge. Each user enters a personal **Upload access code** in Settings → Connections. The code is kept in the native OS credential store. The desktop app sends resumes over HTTPS to Cloud Run; the Apps Script bridge verifies `faisalalam73@gmail.com` before uploading to the fixed folder. Users do not supply their own Google account or choose a Drive folder.
 
-On the first upload, the app opens a browser for Google sign-in and saves the authorization locally as `token.pickle`. It requests the `drive.file` scope. The app uses OAuth desktop credentials; a service-account file is not required.
+The service accepts resumes up to 24 MiB. Existing generated links remain shareable by anyone with the link, as before. If the service or code is unavailable, the row shows an upload failure and can be retried; it never falls back to a user's Drive. Old per-user Drive cache entries are ignored.
 
-Uploads stay in the configured folder. A permission failure is shown as a failure with a retry action; uploads never silently move to My Drive root.
+**Owner setup is required before uploads work in this version.** The client URL in `drive_uploader.py` is intentionally blank until a verified Cloud Run service is deployed. See [owner upload setup](docs/owner-upload-service.md) for provisioning, deployment, and code issuance.
 
 ## Run the app
 
@@ -153,14 +149,14 @@ API key persistence is opt-in and off by default. When enabled, `keyring` must p
 
 ## Local data and privacy
 
-Resume text is sent to the OpenAI API for extraction and, when enabled, job matching. Eligible resume files are uploaded to Google Drive. Use data you are authorized to process and review extracted information and match assessments before relying on them.
+Resume text is sent to the OpenAI API for extraction and, when enabled, job matching. Eligible resume files go through the owner's Cloud Run service to Google Drive. Use data you are authorized to process and review extracted information and match assessments before relying on them.
 
-The app stores runtime data locally:
+The app stores runtime data locally; the two owner-only setup files are kept outside Git:
 
 | File or folder | Purpose |
 | --- | --- |
-| `oauth_credentials.json` | Google OAuth desktop-client configuration |
-| `token.pickle` | Saved Google authorization |
+| `bridge_secret.txt` | Owner-only bridge secret shared between Cloud Run and Apps Script |
+| `upload_codes.json` | Owner-only hashes of users' upload codes, used to create a Cloud Run secret |
 | `resume_cache.json` | Cached extraction and matching data |
 | `jd_cache.json` | Cached job-description data |
 | `drive_cache.json` | Cached upload links and file hashes |
@@ -169,13 +165,14 @@ The app stores runtime data locally:
 | `logs/` | Application logs |
 | `processing_summary.csv` | Per-file processing report in the selected resume folder |
 
-Credentials, tokens, preferences, review state, caches, logs, virtual environments, and processing summaries are excluded by `.gitignore`. Keep resume folders and exported CSV files outside the source checkout; they can contain personal information.
+Credentials, tokens, code hashes, preferences, review state, caches, logs, virtual environments, and processing summaries are excluded by `.gitignore`. Keep resume folders and exported CSV files outside the source checkout; they can contain personal information.
 
 ## Tests
 
 With the virtual environment activated:
 
 ```bash
+python -m pip install -r upload_service/requirements.txt httpx
 python -m unittest discover -q
 ```
 
@@ -185,7 +182,8 @@ Tests cover extraction, matching, caching, upload handling, and UI workflows. Th
 
 ```text
 extractor.py          Desktop UI, file reading, extraction, matching, and export
-drive_uploader.py    Google Drive authorization, uploads, and upload caching
+drive_uploader.py    HTTPS upload client and upload caching
+upload_service/     Owner-operated Cloud Run service and provisioning helpers
 requirements.txt     Python dependencies
 test_extractor.py    Core regression tests
 test_loading_flow.py Folder-discovery and loading-flow tests

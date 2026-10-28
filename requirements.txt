@@ -3,9 +3,7 @@ PyMuPDF; sys_platform != "win32"
 customtkinter
 pydantic
 openai
-google-api-python-client
-google-auth
-google-auth-oauthlib
+requests>=2.31,<3
 comtypes; sys_platform == "win32"
 docx2txt
 

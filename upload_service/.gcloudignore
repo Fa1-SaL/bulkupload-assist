@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.tmp
+*.json
+bridge_url.txt
+bridge_secret.txt
+upload_codes*.json
+oauth_credentials.json
+owner_oauth.json
+service_account.json
+token.pickle
