@@ -16,9 +16,10 @@ from dataclasses import dataclass
 import requests
 
 DRIVE_FOLDER_ID = '1EhV9pbEZjZg2_D7Tg2Z-zlsFK8DY06Ne'  # fixed owner folder
-# Set to the verified owner-run Apps Script /exec URL after a live upload test.
-# The URL is public configuration; each person has a separate signed access code.
+# The owner distributes upload_endpoint.txt with the app; the public repo omits it.
+# Each person also needs a separate signed access code in native keyring.
 UPLOAD_SERVICE_URL = ''
+UPLOAD_ENDPOINT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'upload_endpoint.txt')
 DRIVE_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "drive_cache.json")
 HTTP_TIMEOUT_S = 300
 UPLOAD_CHUNK_SIZE = 1024 * 1024
@@ -45,9 +46,19 @@ def hosted_cache_key(file_hash: str) -> str:
     return f'owner-script-v1:{DRIVE_FOLDER_ID}:{file_hash}'
 
 
+def configured_upload_url() -> str:
+    if UPLOAD_SERVICE_URL:
+        return UPLOAD_SERVICE_URL.strip()
+    try:
+        with open(UPLOAD_ENDPOINT_FILE, 'r', encoding='utf-8') as file:
+            return file.read().strip()
+    except FileNotFoundError:
+        return ''
+
+
 def get_drive_credentials(force_reauth: bool = False) -> str:
     """Read this user's upload access code from native keyring; never use Google OAuth."""
-    if not UPLOAD_SERVICE_URL:
+    if not configured_upload_url():
         raise RuntimeError('Owner upload script is not configured. Contact the app owner.')
     from app_preferences import SecureApiKeyStore
     code = SecureApiKeyStore(service_name='BulkUploadAssist', username='upload_access_code').get()
@@ -72,11 +83,12 @@ def parse_access_code(value: str) -> tuple[str, str]:
 
 def get_drive_service(force_reauth: bool = False, creds=None):
     """Build a separate HTTP session per worker for the fixed owner script."""
-    if not re.fullmatch(r'https://script\.google\.com/macros/s/[\w-]+/exec', UPLOAD_SERVICE_URL):
+    url = configured_upload_url()
+    if not re.fullmatch(r'https://script\.google\.com/macros/s/[\w-]+/exec', url):
         raise RuntimeError('Owner upload script is not configured. Contact the app owner.')
     access_code = creds or get_drive_credentials(force_reauth)
     parse_access_code(access_code)
-    return OwnerScriptService(UPLOAD_SERVICE_URL, access_code, requests.Session())
+    return OwnerScriptService(url, access_code, requests.Session())
 
 
 def get_file_hash(filepath: str) -> str:

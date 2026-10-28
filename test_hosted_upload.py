@@ -28,6 +28,15 @@ class OwnerScriptClientTests(unittest.TestCase):
             self.assertEqual(drive_uploader.get_drive_credentials(), self.code)
         store.assert_called_once_with(service_name="BulkUploadAssist", username="upload_access_code")
 
+    def test_endpoint_is_read_from_local_config_file(self):
+        path = os.path.join(os.path.dirname(self.path), "upload_endpoint.txt")
+        with open(path, "w", encoding="utf-8") as file:
+            file.write(self.service.url + "\n")
+        with patch.object(drive_uploader, "UPLOAD_SERVICE_URL", ""), \
+             patch.object(drive_uploader, "UPLOAD_ENDPOINT_FILE", path):
+            service = drive_uploader.get_drive_service(creds=self.code)
+        self.assertEqual(service.url, self.service.url)
+
     def test_upload_posts_signed_file_without_exposing_the_code(self):
         response = MagicMock(status_code=200)
         response.json.return_value = {"status": "ok", "url": "https://drive.google.com/file/d/abc/view"}

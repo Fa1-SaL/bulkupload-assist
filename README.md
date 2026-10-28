@@ -87,7 +87,7 @@ The app owner operates an Apps Script web app under `faisalalam73@gmail.com`. Ea
 
 The script accepts resumes up to 24 MiB. Existing generated links remain shareable by anyone with the link, as before. If the script or code is unavailable, the row shows an upload failure and can be retried; it never falls back to a user's Drive. Old per-user Drive cache entries are ignored.
 
-**Owner setup is required before uploads work in this version.** The client URL in `drive_uploader.py` is intentionally blank until a verified Apps Script web app is deployed. See [owner upload setup](docs/owner-upload-apps-script.md) for deployment and code issuance. This route does not require a linked Google Cloud billing account.
+The owner has deployed the Apps Script web app. To use uploads, place the owner-provided `upload_endpoint.txt` beside `extractor.py`, then enter your personal access code in Settings. The endpoint file contains a URL, not a Google credential; it stays out of the public repository to reduce unwanted traffic. See [owner upload setup](docs/owner-upload-apps-script.md) for code issuance. This route does not require a linked Google Cloud billing account.
 
 ## Run the app
 
@@ -157,6 +157,7 @@ The app stores runtime data locally; owner-only setup files are kept outside Git
 | --- | --- |
 | `bridge_secret.txt` | Owner-only secret also held in the Apps Script Script Property |
 | `owner_upload_code*.txt` | Private per-user upload access code receipts |
+| `upload_endpoint.txt` | Owner-provided Apps Script URL; distributed privately to staff |
 | `resume_cache.json` | Cached extraction and matching data |
 | `jd_cache.json` | Cached job-description data |
 | `drive_cache.json` | Cached upload links and file hashes |

@@ -48,9 +48,10 @@ code. The code itself is never sent in the request.
    person's code with a different label and output path.
 5. Test a signed `check` request and a synthetic resume upload. Confirm the
    created file belongs to the owner, is in the fixed folder, and its returned
-   link opens as intended. Then set `UPLOAD_SERVICE_URL` in
-   `drive_uploader.py` to the verified Apps Script `/exec` URL and publish the
-   desktop update. This URL is public configuration, never a credential.
+   link opens as intended. Put the verified Apps Script `/exec` URL as the
+   single line of `upload_endpoint.txt` beside `extractor.py` on each staff
+   computer. This URL is not a credential, but it is omitted from the public
+   repository to reduce unwanted traffic to the script.
 
 To revoke one person's code, add their label to `REVOKED_USERS` in
 `owner_upload/owner_bridge.gs` and deploy a new script version. To rotate all
