@@ -310,7 +310,7 @@ class TestSimpleWorkflow(unittest.TestCase):
         self.app.handle_upload_failure('alice.pdf', RuntimeError('offline'), 1)
         self.app.update_upload_progress_ui()
         self.assertIn('Complete with issues', self.app.lbl_status.cget('text'))
-        self.assertEqual(self.app.btn_export.cget('state'), 'disabled')
+        self.assertEqual(self.app.btn_export.cget('state'), 'normal')
         self.app.sv_dir.set(self.folder)
         self.app.retry_failed_uploads()
         self.app.update_upload_progress_ui()
@@ -328,8 +328,9 @@ class TestSimpleWorkflow(unittest.TestCase):
         self.assertIn('1 cancelled', self.app.lbl_status.cget('text'))
         self.assertEqual(len(self.app.extracted_data), 1)
         self.assertEqual(self.app.btn_retry.cget('state'), 'normal')
+        self.assertEqual(self.app.btn_export.cget('state'), 'normal')
 
-    def test_invalid_candidate_cannot_enable_export(self):
+    def test_incomplete_candidate_keeps_export_available(self):
         self.app._run_gen = 1
         self.app._pipeline_running = True
         row = self.candidate(link='Not uploaded')
@@ -337,7 +338,7 @@ class TestSimpleWorkflow(unittest.TestCase):
         row['Status'] = 'Missing Contact Information'
         self.finish_parsing()
         self.assertIn('Complete with issues', self.app.lbl_status.cget('text'))
-        self.assertEqual(self.app.btn_export.cget('state'), 'disabled')
+        self.assertEqual(self.app.btn_export.cget('state'), 'normal')
 
     def test_new_run_cannot_discard_pending_uploads(self):
         self.running()

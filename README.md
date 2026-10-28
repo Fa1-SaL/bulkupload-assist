@@ -111,6 +111,8 @@ A new processing run is blocked while processing, uploads, or a Drive connection
 
 By default, export includes complete candidates with uploaded resumes. The export dialog explicitly offers **All eligible** and **Filtered** scopes with counts. Records are deduplicated by email. Previously generated candidates for the same Job ID trigger a warning; recent Job IDs require an explicit selection. Job-specific rate, availability, notes and full-time fields start fresh in each dialog. Generating a CSV does not submit candidates to an ATS.
 
+**Export CSV** remains available when a settled, parsed candidate has missing fields or a failed upload. In the export dialog, select **Include incomplete candidates** to export those rows with blank missing values. The switch starts with the **Export Missing too** setting, which is off by default; changing it for one export does not change Settings. Rows still processing or uploading, unreadable resumes, and extraction failures cannot be exported.
+
 Files are written to the selected directory as:
 
 ```text

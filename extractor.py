@@ -2321,9 +2321,11 @@ class ExtractorApp(ctk.CTk):
         prefs = getattr(self, 'preferences', {})
         return prefs.get(key, DEFAULT_PREFERENCES.get(key)) if isinstance(prefs,dict) else DEFAULT_PREFERENCES.get(key)
 
-    def _eligible_rows(self, filtered=False):
+    def _eligible_rows(self, filtered=False, include_missing=None):
+        if include_missing is None:
+            include_missing = self._pref('export_missing')
         rows = self._visible_candidates if filtered else self.extracted_data
-        return get_deduplicated_candidates([r for r in rows if exportable(r, self._pref('export_missing'))])
+        return get_deduplicated_candidates([r for r in rows if exportable(r, include_missing)])
 
     def process_action(self):
         if self._pipeline_running or self._has_pending_uploads() or self._connection_busy: return
@@ -2399,7 +2401,8 @@ class ExtractorApp(ctk.CTk):
         self.btn_cancel_uploads.configure(state="normal" if pending else "disabled")
         eligible = [r for r in self.extracted_data if exportable(r, ExtractorApp._pref(self, "export_missing"))]
         eligible = get_deduplicated_candidates(eligible)
-        self.btn_export.configure(state="normal" if eligible and not self._pipeline_running else "disabled",
+        has_settled_rows = bool(eligible) or any(exportable(r, True) for r in self.extracted_data)
+        self.btn_export.configure(state="normal" if has_settled_rows and not self._pipeline_running else "disabled",
                                   text=f"Export CSV ({len(eligible)})" if eligible else "Export CSV")
         if self._pipeline_error:
             suffix = " Uploads continuing." if pending else ""
@@ -4520,11 +4523,12 @@ Years of Experience: {cand_data.get('YearsOfExperience')}
         self.open_final_export_dialog()
 
     def open_final_export_dialog(self):
-        all_rows = self._eligible_rows()
-        filtered_rows = self._eligible_rows(filtered=True)
-        if not all_rows:
-            messagebox.showwarning('Export CSV','No settled, eligible candidates to export. Review Needs attention or enable Export Missing too in Settings.')
+        if not self._eligible_rows(include_missing=True):
+            messagebox.showwarning('Export CSV','No settled, parsed candidates to export yet.')
             return
+        include_missing = tk.BooleanVar(value=self._pref('export_missing'))
+        all_rows = self._eligible_rows(include_missing=include_missing.get())
+        filtered_rows = self._eligible_rows(filtered=True, include_missing=include_missing.get())
         regular = self._pref('regular_export')
         matched = self._batch_matching_enabled
         dialog = ctk.CTkToplevel(self)
@@ -4544,15 +4548,33 @@ Years of Experience: {cand_data.get('YearsOfExperience')}
         scope = tk.StringVar(value=f'All eligible ({len(all_rows)})')
         options=[f'All eligible ({len(all_rows)})',f'Filtered ({len(filtered_rows)})']
         ctk.CTkLabel(body,text='Include',anchor='w').grid(row=2,column=0,sticky='w')
-        ctk.CTkOptionMenu(body,values=options,variable=scope,height=36,width=280).grid(row=2,column=1,padx=(16,0),sticky='ew')
-        missing = sum(bool(attention_reasons(r)) for r in all_rows)
-        description = (f'Includes {missing} records needing review. Missing values stay blank.' if self._pref('export_missing')
-                       else 'Complete candidates with uploaded resumes only.')
-        ctk.CTkLabel(body,text=description,text_color=WARNING_TEXT if self._pref('export_missing') else MUTED_TEXT,
-            anchor='w',wraplength=480,justify='left').grid(row=3,column=0,columnspan=2,sticky='w',pady=(8,12))
-        ctk.CTkLabel(body,text='Job ID'+(' (optional)' if regular else ''),anchor='w').grid(row=4,column=0,sticky='w')
+        scope_menu=ctk.CTkOptionMenu(body,values=options,variable=scope,height=36,width=280)
+        scope_menu.grid(row=2,column=1,padx=(16,0),sticky='ew')
+        description_label=ctk.CTkLabel(body,text='',text_color=MUTED_TEXT,
+            anchor='w',wraplength=480,justify='left')
+        def refresh_export_rows():
+            nonlocal all_rows,filtered_rows,options
+            all_rows=self._eligible_rows(include_missing=include_missing.get())
+            filtered_rows=self._eligible_rows(filtered=True,include_missing=include_missing.get())
+            options=[f'All eligible ({len(all_rows)})',f'Filtered ({len(filtered_rows)})']
+            scope_menu.configure(values=options)
+            scope.set(options[0])
+            if include_missing.get():
+                incomplete=sum(not exportable(r) for r in all_rows)
+                description=f'Includes {incomplete} incomplete records. Missing values, including failed upload links, stay blank.'
+            elif not all_rows:
+                description='No complete uploaded candidates yet. Include incomplete candidates to export settled rows.'
+            else:
+                description='Complete candidates with uploaded resumes only.'
+            description_label.configure(text=description,
+                text_color=WARNING_TEXT if include_missing.get() or not all_rows else MUTED_TEXT)
+        ctk.CTkCheckBox(body,text='Include incomplete candidates',variable=include_missing,
+            command=refresh_export_rows).grid(row=3,column=0,columnspan=2,sticky='w',pady=(10,0))
+        description_label.grid(row=4,column=0,columnspan=2,sticky='w',pady=(8,12))
+        refresh_export_rows()
+        ctk.CTkLabel(body,text='Job ID'+(' (optional)' if regular else ''),anchor='w').grid(row=5,column=0,sticky='w')
         entry_job_id=ctk.CTkEntry(body,placeholder_text='e.g. JOB_101',width=280,height=36)
-        entry_job_id.grid(row=4,column=1,padx=(16,0),sticky='ew')
+        entry_job_id.grid(row=5,column=1,padx=(16,0),sticky='ew')
         recent = list(reversed(self._review_store.history))[:8]
         if recent:
             pick=tk.StringVar(value='Choose recent Job ID')
@@ -4560,9 +4582,9 @@ Years of Experience: {cand_data.get('YearsOfExperience')}
                 if value=='Choose recent Job ID': return
                 entry_job_id.delete(0,tk.END);entry_job_id.insert(0,value)
             ctk.CTkOptionMenu(body,values=['Choose recent Job ID']+recent,variable=pick,
-                command=use_recent,height=36,width=280).grid(row=5,column=1,padx=(16,0),sticky='ew',pady=(8,0))
+                command=use_recent,height=36,width=280).grid(row=6,column=1,padx=(16,0),sticky='ew',pady=(8,0))
         error=ctk.CTkLabel(body,text='',text_color=DANGER_TEXT,anchor='w',wraplength=450)
-        error.grid(row=6,column=0,columnspan=2,sticky='w')
+        error.grid(row=7,column=0,columnspan=2,sticky='w')
         more=ctk.CTkFrame(body,fg_color='transparent')
         more.grid_columnconfigure(1,weight=1)
         fields={}
@@ -4577,13 +4599,14 @@ Years of Experience: {cand_data.get('YearsOfExperience')}
             if more.winfo_manager():
                 more.grid_remove();btn_more.configure(text='More options ▸')
             else:
-                more.grid(row=8,column=0,columnspan=2,sticky='ew',pady=8);btn_more.configure(text='Fewer options ▾')
+                more.grid(row=9,column=0,columnspan=2,sticky='ew',pady=8);btn_more.configure(text='Fewer options ▾')
         btn_more=secondary_button(body,text='More options ▸',width=150,command=toggle_more)
-        if not regular: btn_more.grid(row=7,column=0,columnspan=2,sticky='w')
+        if not regular: btn_more.grid(row=8,column=0,columnspan=2,sticky='w')
         def submit(event=None):
             if generation != self._run_gen:
                 dialog.destroy();return
-            rows = filtered_rows if scope.get()==options[1] else all_rows
+            rows = self._eligible_rows(filtered=scope.get()==options[1],
+                                       include_missing=include_missing.get())
             job = entry_job_id.get().strip()
             if not rows:
                 error.configure(text='No eligible candidates in the current filter.');return
@@ -4591,9 +4614,9 @@ Years of Experience: {cand_data.get('YearsOfExperience')}
                 error.configure(text='Enter a Job ID to export.');entry_job_id.focus_set();return
             self.execute_final_export(dialog,rows,job,fields['rate'].get(),fields['weeks'].get(),
                 fields['notes'].get(),fulltime.get(),regular=regular,matched=matched)
-        ctk.CTkLabel(body,text='CSV generation does not submit candidates to an ATS.',anchor='w',text_color=MUTED_TEXT).grid(row=9,column=0,columnspan=2,sticky='w',pady=(14,0))
+        ctk.CTkLabel(body,text='CSV generation does not submit candidates to an ATS.',anchor='w',text_color=MUTED_TEXT).grid(row=10,column=0,columnspan=2,sticky='w',pady=(14,0))
         buttons=ctk.CTkFrame(body,fg_color='transparent')
-        buttons.grid(row=10,column=0,columnspan=2,sticky='e',pady=(16,0))
+        buttons.grid(row=11,column=0,columnspan=2,sticky='e',pady=(16,0))
         secondary_button(buttons,text='Cancel',width=120,command=dialog.destroy).pack(side='left',padx=(0,8))
         ctk.CTkButton(buttons,text='Generate CSV',width=150,height=36,command=submit).pack(side='left')
         dialog.bind('<Return>',submit);dialog.bind('<Escape>',lambda e:dialog.destroy())
