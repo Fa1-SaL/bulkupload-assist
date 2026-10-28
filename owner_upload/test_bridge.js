@@ -13,6 +13,8 @@ const created = [];
 const seen = new Map();
 let account = 'faisalalam73@gmail.com';
 let folderOwner = 'faisalalam73@gmail.com';
+let sharingFails = false;
+let trashed = 0;
 
 const globals = {
   ContentService: {
@@ -38,7 +40,9 @@ const globals = {
         created.push(blob);
         return {setSharing: (access, permission) => {
           assert.equal(access, 'anyone'); assert.equal(permission, 'view');
-        }, getId: () => 'file123'};
+          if (sharingFails) throw new Error('sharing failed');
+        }, setTrashed: value => {assert.equal(value, true); trashed += 1;},
+        getId: () => 'file123'};
       }};
     },
   },
@@ -88,4 +92,7 @@ assert.equal(created.length, 1);
 assert.deepEqual(send({nonce: 'sixth-nonce-for-test-case', user: 'member-1'}),
   {status: 'ok', url: 'https://drive.google.com/file/d/file123/view'});
 assert.equal(created.length, 2);
-console.log('Apps Script bridge: 8 checks passed');
+sharingFails = true;
+assert.equal(send({nonce: 'seventh-nonce-for-test-case'}).code, 'upload_failed');
+assert.equal(trashed, 1);
+console.log('Apps Script bridge: 9 checks passed');

@@ -76,7 +76,8 @@ function doPost(e) {
     }
 
     const folder = DriveApp.getFolderById(FOLDER_ID);
-    if (!folder.getOwner() || folder.getOwner().getEmail().toLowerCase() !== OWNER_EMAIL) {
+    const folderOwner = folder.getOwner();
+    if (!folderOwner || folderOwner.getEmail().toLowerCase() !== OWNER_EMAIL) {
       return reply_({status: 'error', code: 'folder_owner_mismatch'});
     }
     if (action === 'check') return reply_({status: 'ready'});
@@ -86,7 +87,13 @@ function doPost(e) {
     }
     const blob = Utilities.newBlob(bytes, mime, name);
     const file = folder.createFile(blob);
-    file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+    try {
+      file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+    } catch (error) {
+      // A failed sharing change must not leave an unlinked duplicate in Drive.
+      file.setTrashed(true);
+      throw error;
+    }
     return reply_({status: 'ok', url: 'https://drive.google.com/file/d/' + file.getId() + '/view'});
   } catch (_) {
     return reply_({status: 'error', code: 'upload_failed'});
