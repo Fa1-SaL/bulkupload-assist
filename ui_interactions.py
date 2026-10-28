@@ -21,6 +21,14 @@ def _exists(widget):
         return False
 
 
+def bind_touchpad_scroll(widget, callback, add=None):
+    """Attach Tk 9 precision input when supported; Tk 8 keeps wheel bindings."""
+    try:
+        return widget.bind('<TouchpadScroll>', callback, add=add)
+    except tk.TclError:
+        return None
+
+
 def touchpad_deltas(widget, event):
     """Pixel (dx, dy) of a Tk 9 <TouchpadScroll> event, or (0, 0).
 
@@ -67,7 +75,9 @@ class SmoothTreeScroll:
             self._bindings.append((sequence, tree.bind(sequence, self.handle_wheel, add='+')))
         # Tk 9's own Treeview binding acts on only every fifth trackpad event and
         # moves in coarse units, which reads as lag. Handle every event in pixels.
-        self._bindings.append(('<TouchpadScroll>', tree.bind('<TouchpadScroll>', self.handle_touchpad, add='+')))
+        touchpad_binding = bind_touchpad_scroll(tree, self.handle_touchpad, add='+')
+        if touchpad_binding:
+            self._bindings.append(('<TouchpadScroll>', touchpad_binding))
         self._bindings.append(('<Destroy>', tree.bind('<Destroy>', self._on_destroy, add='+')))
 
     def _view(self, axis):

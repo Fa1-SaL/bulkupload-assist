@@ -26,7 +26,8 @@ try:
     from workflow_policy import exportable, csv_fields, csv_values, attention_reasons, merge_duplicates, ReviewStore, parsed as parsed_candidate, clean as clean_field
     from app_preferences import DEFAULT_PREFERENCES, PreferenceStore, SecureApiKeyStore, SettingsWindow
     from ui_interactions import (SmoothTreeScroll, Tooltip, animate_window_open, animate_window_close, fade_through,
-                                 animate_height, is_animating, MOTION_ENTER_MS, MOTION_EXIT_MS, UI_FONT_FAMILY)
+                                 animate_height, is_animating, MOTION_ENTER_MS, MOTION_EXIT_MS, UI_FONT_FAMILY,
+                                 bind_touchpad_scroll)
 except Exception as startup_err:
     tb = traceback.format_exc()
     try:
@@ -1719,13 +1720,13 @@ class ExtractorApp(ctk.CTk):
             reduced_motion=lambda: self.preferences['reduce_motion'])
         for sequence in ('<MouseWheel>', '<Shift-MouseWheel>', '<Button-4>', '<Button-5>'):
             self.bind(sequence, self._route_table_wheel, add='+')
-        self.bind('<TouchpadScroll>', lambda event: self._route_table_wheel(event, touchpad=True), add='+')
+        bind_touchpad_scroll(self, lambda event: self._route_table_wheel(event, touchpad=True), add='+')
         # Bypass CTkScrollbar's coarse wheel callback; keep its click/drag bindings.
         for bar, axis in ((self.scrollbar_x,'x'), (self.scrollbar_y,'y')):
             for sequence in ('<MouseWheel>', '<Shift-MouseWheel>', '<Button-4>', '<Button-5>'):
                 bar._canvas.bind(sequence, lambda event, a=axis:
                     self._smooth_scroll.handle_wheel(event, axis='x' if event.state & 1 else a))
-            bar._canvas.bind('<TouchpadScroll>', self._smooth_scroll.handle_touchpad)
+            bind_touchpad_scroll(bar._canvas, self._smooth_scroll.handle_touchpad)
         self.bv_attention = tk.BooleanVar(value=False)
         self.chk_attention = ctk.CTkCheckBox(self.frame_filters, text='Needs attention (0)',
             variable=self.bv_attention, command=self.filter_table)

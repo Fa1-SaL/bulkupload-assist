@@ -15,7 +15,7 @@ from tkinter import filedialog
 
 import customtkinter as ctk
 
-from ui_interactions import animate_window_close, animate_window_open, touchpad_deltas
+from ui_interactions import animate_window_close, animate_window_open, touchpad_deltas, bind_touchpad_scroll
 
 
 DEFAULT_PREFERENCES = {
@@ -199,7 +199,7 @@ class SettingsWindow(ctk.CTkToplevel):
         for sequence in ('<MouseWheel>', '<Button-4>', '<Button-5>'):
             self.bind(sequence, self._scroll_settings, add='+')
         # Tk 9 delivers trackpad gestures as <TouchpadScroll>, which nothing else handles here.
-        self.bind('<TouchpadScroll>', self._touchpad_scroll, add='+')
+        bind_touchpad_scroll(self, self._touchpad_scroll, add='+')
         self._closing = False
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(0, weight=1)
