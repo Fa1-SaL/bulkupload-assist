@@ -26,6 +26,8 @@ PDF, DOCX, and TXT reading does not require Microsoft Word. Legacy DOC files req
 
 Windows reads PDFs with the pure-Python `pypdf` library and never imports PyMuPDF's native DLLs. This supports PDF text and hyperlink annotations while keeping Smart App Control enabled. macOS and Linux use PyMuPDF when available, with pypdf as a fallback if the native library cannot load or read a document. Password-protected PDFs without an available password remain read failures.
 
+The desktop UI supports Windows Tk 8.6. Tk 9 precision touchpad events are registered only when supported; standard mouse-wheel and Shift + wheel scrolling remain available on older Tk.
+
 ## Installation
 
 Clone the repository and create a virtual environment:
